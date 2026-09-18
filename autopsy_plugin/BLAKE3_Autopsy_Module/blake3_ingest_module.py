@@ -500,7 +500,33 @@ def _refresh_autopsy_hash_checks(rows):
 
 
 def _category(name):
-    extension = os.path.splitext(str(name or ""))[1].lower()
+    raw_name = str(name or "")
+    basename = os.path.basename(raw_name)
+    # Strip common Autopsy-appended suffixes (slack space copies, ADS
+    # streams) so the underlying artifact name can still be recognized.
+    metadata_stem = basename.split("-slack", 1)[0].split(":", 1)[0].strip()
+    extension = os.path.splitext(raw_name)[1].lower()
+
+    # NTFS / exFAT / FAT filesystem metadata and other synthetic
+    # filesystem-internal objects (e.g. $MFT, $Bitmap, $UpCase,
+    # $ALLOC_BITMAP, and their slack-space copies) carry no conventional
+    # extension and would otherwise all collapse into "Other". Recognizing
+    # them by name keeps that bucket meaningful.
+    filesystem_metadata_names = (
+        "$MFT", "$MFTMIRR", "$LOGFILE", "$VOLUME", "$ATTRDEF", "$BITMAP",
+        "$BOOT", "$BADCLUS", "$SECURE", "$UPCASE", "$UPCASE_TABLE",
+        "$EXTEND", "$QUOTA", "$OBJID", "$REPARSE", "$USNJRNL", "$TXF_DATA",
+        "$ALLOC_BITMAP", "$UNALLOC", "$ROOT", "$FAT1", "$FAT2",
+        "$ORPHANFILES", "$DIRECTORY", "$I30",
+    )
+    if metadata_stem.startswith("$") or metadata_stem.upper() in filesystem_metadata_names:
+        return "Filesystem Metadata"
+
+    # OS paging/hibernation files: not user documents, and worth their own
+    # bucket rather than falling into "Other" or "System & Logs" noise.
+    if basename.lower() in ("pagefile.sys", "hiberfil.sys", "swapfile.sys"):
+        return "OS Paging & Hibernation"
+
     categories = [
         ("Documents", (
             ".pdf", ".docx", ".doc", ".rtf", ".odt", ".txt", ".md",
@@ -824,17 +850,32 @@ class BLAKE3FileIngestModule(FileIngestModule):
     def process(self, file_obj):
         try:
             file_type = file_obj.getType()
-            if file_obj.isDir() or file_type in (
-                TskData.TSK_DB_FILES_TYPE_ENUM.UNALLOC_BLOCKS,
-                TskData.TSK_DB_FILES_TYPE_ENUM.UNUSED_BLOCKS,
-            ):
+            skip_reason = None
+            if file_obj.isDir():
+                skip_reason = (
+                    "Directory entry: represents a folder in the filesystem "
+                    "tree, not file content, so there are no bytes to hash."
+                )
+            elif file_type == TskData.TSK_DB_FILES_TYPE_ENUM.UNALLOC_BLOCKS:
+                skip_reason = (
+                    "Unallocated space block file: a synthetic Autopsy object "
+                    "representing free/deleted space on the volume rather "
+                    "than a real, recovered file."
+                )
+            elif file_type == TskData.TSK_DB_FILES_TYPE_ENUM.UNUSED_BLOCKS:
+                skip_reason = (
+                    "Unused space block file: a synthetic Autopsy object "
+                    "representing reserved-but-unused space on the volume "
+                    "rather than a real, recovered file."
+                )
+            if skip_reason is not None:
                 _record(self.job_id, {
                     "status": "skipped",
                     "name": _safe_name(file_obj),
                     "source_kind": "File",
                     "category": _category(_safe_name(file_obj)),
                     "size_bytes": int(file_obj.getSize()),
-                    "reason": "directory or non-file block range",
+                    "reason": skip_reason,
                 })
                 return IngestModule.ProcessResult.OK
             row = _hash_one(
