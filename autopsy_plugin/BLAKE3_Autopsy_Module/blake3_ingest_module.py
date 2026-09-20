@@ -17,6 +17,7 @@ import os
 import shutil
 import threading
 import time
+import traceback
 
 from java.io import BufferedReader
 from java.io import File as JFile
@@ -83,6 +84,18 @@ EVIDENCE_CACHE_WARMUP = (
     os.environ.get("BLAKE3_EVIDENCE_CACHE_WARMUP", "1").strip().lower()
     not in ("0", "false", "no", "off")
 )
+
+# ── Batch IPC tunables ───────────────────────────────────────────────────────
+# Number of small files queued per ingest thread before flushing one IPC batch.
+# Each ingest thread holds its own queue so total in-flight = BATCH_WINDOW × threads.
+BATCH_WINDOW = _environment_integer("BLAKE3_BATCH_WINDOW", 32)
+# Files at or above this size bypass the batch queue and use the single-file
+# path so they can benefit from native tree parallelism in the sidecar.
+# Must match BLAKE3_SMALL_FILE_LIMIT set on the sidecar process.
+_SMALL_FILE_LIMIT = _environment_integer(
+    "BLAKE3_SMALL_FILE_LIMIT", 32 * 1024 * 1024
+)
+BATCH_MAX_BYTES = _SMALL_FILE_LIMIT
 
 _JOBS = {}
 _JOBS_LOCK = threading.RLock()
@@ -250,15 +263,21 @@ def _register_report_listener(job_id, data_source):
 
 
 def _adaptive_buffer(size_bytes):
-    if size_bytes < 1024 * 1024:
+    """Mirror the sidecar's adaptive_chunk_size with a smooth \u22644\u00d7 ramp.
+
+    Adjacent tiers differ by at most 4\u00d7, eliminating the previous 8\u00d7 jump at
+    the old 16 MiB boundary.  Values are kept in sync with the sidecar via the
+    shared BLAKE3_SMALL_FILE_LIMIT environment variable.
+    """
+    if size_bytes < 512 * 1024:
         return 64 * 1024
-    if size_bytes < 16 * 1024 * 1024:
+    if size_bytes < 4 * 1024 * 1024:
         return 256 * 1024
-    if size_bytes < 64 * 1024 * 1024:
+    if size_bytes < _SMALL_FILE_LIMIT:
+        return 512 * 1024
+    if size_bytes < 128 * 1024 * 1024:
         return 2 * 1024 * 1024
-    if size_bytes < 256 * 1024 * 1024:
-        return 8 * 1024 * 1024
-    if size_bytes < 2 * 1024 * 1024 * 1024:
+    if size_bytes < 1024 * 1024 * 1024:
         return 8 * 1024 * 1024
     return 16 * 1024 * 1024
 
@@ -442,6 +461,194 @@ class _Sidecar(object):
         if result.get("status") != "ok" or digest != KNOWN_EMPTY:
             return False, "empty-input published vector mismatch"
         return True, "published empty-input vector passed"
+
+    def batch_self_test(self):
+        """Verify the sidecar actually understands the batch wire protocol
+        ({"batch": M, "requests": [...]}) before any real evidence is queued
+        through it.
+
+        A sidecar exe built from a pre-batching optimized_blake3.py doesn't
+        recognize the "batch" key, raises inside its own request parser on
+        the first real batch, and desyncs this persistent connection for the
+        rest of the job -- corrupting every file processed afterward,
+        including the evidence-source and comparison passes the HTML report
+        depends on. There is no reliable way to detect that after the fact,
+        so this sends one deterministic, throwaway batch request up front and
+        fails loudly if the sidecar doesn't answer it correctly.
+        """
+        try:
+            results = self.hash_batch(
+                [(_EmptyContent(), 0, "blake3_optimized")],
+                context=None,
+                _recover=False,
+            )
+        except Exception as exc:
+            return False, "batch protocol probe raised an exception: " + str(exc)
+        if len(results) != 1:
+            return False, (
+                "batch protocol probe returned %d result line(s) for 1 "
+                "request; the sidecar does not speak the batch protocol"
+                % len(results)
+            )
+        actual, result, error = results[0]
+        digest = str(result.get("digest", "")).lower() if result else ""
+        if error or result is None or result.get("status") != "ok" or digest != KNOWN_EMPTY:
+            return False, (
+                "batch protocol probe failed (%s); the sidecar was likely "
+                "built before batching was added to optimized_blake3.py"
+                % (error or (result.get("message") if result else "no result"))
+            )
+        # Even a passing probe leaves no guarantee the connection is clean if
+        # anything upstream partially desynced it; force a fresh, validated
+        # connection before any real evidence work begins.
+        try:
+            self._restart_and_validate()
+        except Exception as exc:
+            return False, "sidecar restart after batch probe failed: " + str(exc)
+        return True, "batch protocol probe passed"
+
+    def hash_batch(self, items, context=None, _recover=True):
+        """Hash multiple files in a single IPC round-trip.
+
+        Parameters
+        ----------
+        items : list of (content, size_bytes, profile)
+            Each ``content`` must support the Autopsy AbstractFile.read()
+            interface.  ``size_bytes`` is the declared byte count.
+
+        Returns
+        -------
+        list of (actual_bytes_read, result_dict_or_None, error_string_or_None)
+            One tuple per input item in the same order as ``items``.
+        """
+        if not items:
+            return []
+
+        # ── 1. Build and send the batch header ──────────────────────────────
+        requests_meta = [
+            {"size": int(sz), "profile": str(prof)}
+            for (_, sz, prof) in items
+        ]
+        batch_header = json.dumps({
+            "batch": len(items),
+            "requests": requests_meta,
+        })
+        header_bytes = JString(batch_header + "\n").getBytes("US-ASCII")
+        try:
+            self.output.write(header_bytes)
+        except Exception as exc:
+            err = "BATCH_HEADER_IO_ERROR: " + str(exc)
+            if _recover:
+                try:
+                    self._restart_and_validate()
+                    err += "; ENGINE_RESTARTED_AND_SELF_TESTED"
+                except Exception as re:
+                    err += "; ENGINE_RESTART_FAILED: " + str(re)
+            return [(0, None, err)] * len(items)
+
+        # ── 2. Stream all file bytes back-to-back ────────────────────────────
+        offsets = []
+        errors = []
+        desync = False
+        for (content, size_bytes, profile) in items:
+            size_bytes = int(size_bytes)
+            chunk_size = _adaptive_buffer(size_bytes)
+            buffer = zeros(chunk_size, 'b')
+            offset = 0
+            item_error = None
+
+            if desync:
+                # After a mid-batch send failure the pipe is desynchronised;
+                # mark all remaining items without trying to read results.
+                offsets.append(0)
+                errors.append("BATCH_DESYNC_BEFORE_SEND")
+                continue
+
+            try:
+                while offset < size_bytes:
+                    if context is not None:
+                        try:
+                            if context.isJobCancelled():
+                                item_error = "CANCELLED"
+                                desync = True
+                                break
+                        except Exception:
+                            pass
+                    requested = min(chunk_size, size_bytes - offset)
+                    count = content.read(buffer, offset, requested)
+                    if count <= 0:
+                        break
+                    self.output.write(buffer, 0, count)
+                    offset += count
+            except Exception as exc:
+                item_error = "AUTOPSY_STREAM_IO_ERROR: " + str(exc)
+                desync = True
+
+            if item_error is None and offset != size_bytes:
+                item_error = "SHORT_READ (%d of %d bytes)" % (offset, size_bytes)
+                desync = True
+
+            offsets.append(offset)
+            errors.append(item_error)
+
+        # ── 3. Flush once for the entire batch ───────────────────────────────
+        try:
+            self.output.flush()
+        except Exception as exc:
+            err = "BATCH_FLUSH_IO_ERROR: " + str(exc)
+            return [
+                (offsets[i] if i < len(offsets) else 0, None,
+                 errors[i] if (i < len(errors) and errors[i]) else err)
+                for i in range(len(items))
+            ]
+
+        # ── 4. Read N result lines (sidecar writes them all before flushing) ─
+        results = []
+        for i in range(len(items)):
+            actual = offsets[i] if i < len(offsets) else 0
+            send_error = errors[i] if i < len(errors) else "BATCH_SEND_INCOMPLETE"
+
+            if send_error:
+                # Pipe is desynchronised; restart once then mark all remaining.
+                if _recover:
+                    try:
+                        self._restart_and_validate()
+                        send_error += "; ENGINE_RESTARTED_AND_SELF_TESTED"
+                    except Exception as re:
+                        send_error += "; ENGINE_RESTART_FAILED: " + str(re)
+                    _recover = False  # restart only once per batch
+                results.append((actual, None, send_error))
+                for j in range(i + 1, len(items)):
+                    results.append((0, None, "BATCH_DESYNC_AFTER_ITEM_%d" % i))
+                return results
+
+            try:
+                line = self.input.readLine()
+            except Exception as exc:
+                read_err = "ENGINE_RESPONSE_IO_ERROR: " + str(exc)
+                if _recover:
+                    try:
+                        self._restart_and_validate()
+                        read_err += "; ENGINE_RESTARTED_AND_SELF_TESTED"
+                    except Exception as re:
+                        read_err += "; ENGINE_RESTART_FAILED: " + str(re)
+                results.append((actual, None, read_err))
+                for j in range(i + 1, len(items)):
+                    results.append((0, None, "BATCH_DESYNC_AFTER_ITEM_%d" % i))
+                return results
+
+            if not line:
+                results.append((actual, None, "NO_ENGINE_RESPONSE"))
+                for j in range(i + 1, len(items)):
+                    results.append((0, None, "BATCH_DESYNC_AFTER_ITEM_%d" % i))
+                return results
+
+            try:
+                results.append((actual, json.loads(str(line)), None))
+            except Exception:
+                results.append((actual, None, "INVALID_ENGINE_RESPONSE"))
+
+        return results
 
     def close(self):
         self._stop()
@@ -823,11 +1030,22 @@ def _startup_module(module, context):
         raise IngestModule.IngestModuleException(
             "BLAKE3 engine published-vector self-test failed: " + message
         )
+    batch_passed, batch_message = module.sidecar.batch_self_test()
+    if not batch_passed:
+        module.sidecar.close()
+        raise IngestModule.IngestModuleException(
+            "BLAKE3 sidecar does not support the batch IPC protocol used by "
+            "this ingest module (" + batch_message + "). Rebuild "
+            "optimized_blake3_hasher.exe from the current optimized_blake3.py "
+            "via build_sidecar.ps1 and replace it next to "
+            "blake3_ingest_module.py, then re-run ingest."
+        )
     with _JOBS_LOCK:
         stats = _job(module.job_id)
         stats["engine_path"] = module.engine_path
         stats["engine_sha256"] = _sha256_file(module.engine_path)
         stats["self_test"] = "PASSED: " + message
+        stats["batch_self_test"] = "PASSED: " + batch_message
     _instance_started(module.job_id)
 
 
@@ -843,9 +1061,13 @@ class BLAKE3FileIngestModule(FileIngestModule):
         self.context = None
         self.sidecar = None
         self.job_id = None
+        # Per-instance pending-batch queue (each Autopsy ingest thread gets its
+        # own module instance, so no cross-thread sharing occurs here).
+        self._batch_queue = []
 
     def startUp(self, context):
         _startup_module(self, context)
+        self._batch_queue = []
 
     def process(self, file_obj):
         try:
@@ -878,61 +1100,25 @@ class BLAKE3FileIngestModule(FileIngestModule):
                     "reason": skip_reason,
                 })
                 return IngestModule.ProcessResult.OK
-            row = _hash_one(
-                self.sidecar,
-                file_obj,
-                int(file_obj.getSize()),
-                self.context,
-                "File",
-            )
-            if row["status"] == "ok":
-                integrity_sample, performance_sample = _claim_comparison_sample(
-                    self.job_id,
-                    row.get("category", "Other"),
-                    row.get("size_bytes", 0),
+
+            size_bytes = int(file_obj.getSize())
+
+            # Large files bypass the batch queue: they benefit from native tree
+            # parallelism inside the sidecar, which works best one file at a time.
+            if size_bytes >= BATCH_MAX_BYTES:
+                row = _hash_one(
+                    self.sidecar, file_obj, size_bytes, self.context, "File"
                 )
-                run_comparison = integrity_sample or performance_sample
-                row["comparison_integrity_sample"] = bool(integrity_sample)
-                row["comparison_performance_sample"] = bool(performance_sample)
-                row["comparison_scope"] = (
-                    "all-files" if COMPARE_EVERY_FILE else (
-                        "integrity+performance" if integrity_sample and performance_sample else (
-                            "performance" if performance_sample else (
-                                "integrity" if integrity_sample else "optimized-only"
-                            )
-                        )
-                    )
-                )
-                if run_comparison:
-                    comparison = _comparison_hashes(
-                        self.sidecar,
-                        file_obj,
-                        int(file_obj.getSize()),
-                        self.context,
-                        row.get("digest", ""),
-                    )
-                    row.update(comparison)
-                    row["md5"] = comparison.get("md5_digest", "")
-                    row["sha1"] = comparison.get("sha1_digest", "")
-                    row["sha256"] = comparison.get("sha256_digest", "")
-                _attach_autopsy_hash_checks(row, file_obj)
-                if (
-                    run_comparison
-                    and row.get("baseline_blake3_status") == "ok"
-                    and not row.get("baseline_blake3_matches")
-                ):
-                    row["status"] = "error"
-                    row["error"] = "BASELINE_BLAKE3_DIGEST_MISMATCH"
-            _record(self.job_id, row)
-            if row["status"] == "ok":
-                if POST_ALL_FILE_ARTIFACTS or row.get("comparison_scope") != "optimized-only":
-                    _post_artifact(self.blackboard, file_obj, row)
-            elif row["status"] == "error":
-                self.services.postMessage(IngestMessage.createMessage(
-                    IngestMessage.MessageType.ERROR,
-                    MODULE_NAME,
-                    "BLAKE3 failed for %s: %s" % (row["name"], row.get("error", "")),
-                ))
+                self._post_file_row(row, file_obj)
+                return IngestModule.ProcessResult.OK
+
+            # Accumulate small files into the batch queue.
+            self._batch_queue.append(file_obj)
+            if len(self._batch_queue) >= BATCH_WINDOW:
+                pending = self._batch_queue
+                self._batch_queue = []
+                self._flush_batch(pending)
+
         except Exception as exc:
             _record(self.job_id, {
                 "status": "error",
@@ -944,7 +1130,196 @@ class BLAKE3FileIngestModule(FileIngestModule):
             })
         return IngestModule.ProcessResult.OK
 
+    def _flush_batch(self, pending):
+        """Send a window of small files to the sidecar in one IPC burst."""
+        items = [
+            (f, int(f.getSize()), "blake3_optimized")
+            for f in pending
+        ]
+        batch_started_ns = System.nanoTime()
+        batch_results = self.sidecar.hash_batch(items, context=self.context)
+        batch_elapsed_ms = max(
+            0.0, (System.nanoTime() - batch_started_ns) / 1000000.0
+        )
+
+        # There is only one measured round trip for the whole batch, not one
+        # per file. Every total in _generate_report (the Executive Summary
+        # "Hashing Speed" figure, every row of the Speed Comparison table, and
+        # stats["elapsed_ms"] in _record) sums end_to_end_elapsed_ms across
+        # every "ok" file and assumes that sum is meaningful. Leaving it at a
+        # flat 0.0 per file didn't raise anything by itself -- every division
+        # against it is already guarded -- but it silently broke that
+        # invariant: files still added their full size_bytes to every total
+        # while contributing 0 ms, so aggregate throughput/timing figures
+        # became wrong (usually driven toward 0.00 MiB/s, or wildly inflated
+        # if only a few non-batched files carried the whole job's timing) as
+        # soon as batching handled any meaningful share of a job. Instead,
+        # distribute the one measured round trip across the batch's files
+        # proportional to bytes actually transferred, so each row -- and every
+        # total derived from it -- carries a real, additive timing figure.
+        total_actual_bytes = sum(
+            max(0, int(batch_item[0])) for batch_item in batch_results
+        )
+
+        for file_obj, batch_item in zip(pending, batch_results):
+            actual, engine_result, bridge_error = batch_item
+            size_bytes = int(file_obj.getSize())
+            name = _safe_name(file_obj)
+
+            if total_actual_bytes > 0:
+                item_elapsed_ms = batch_elapsed_ms * (
+                    max(0, int(actual)) / float(total_actual_bytes)
+                )
+            elif batch_results:
+                item_elapsed_ms = batch_elapsed_ms / float(len(batch_results))
+            else:
+                item_elapsed_ms = 0.0
+            item_throughput = (
+                (float(size_bytes) / (1024.0 * 1024.0)) / (item_elapsed_ms / 1000.0)
+                if item_elapsed_ms > 0.0 else 0.0
+            )
+
+            base = {
+                "name": name,
+                "source_kind": "File",
+                "category": _category(name),
+                "size_bytes": size_bytes,
+                "bytes_read": int(actual),
+                # Distributed from one measured batch round trip, not
+                # individually timed -- see batch_elapsed_ms/batch_item_count
+                # on this row for the true measurement it was derived from.
+                "end_to_end_elapsed_ms": round(item_elapsed_ms, 3),
+                "throughput_mb_s": round(item_throughput, 3),
+                "batch_mode": True,
+                "batch_elapsed_ms": round(batch_elapsed_ms, 3),
+                "batch_item_count": len(batch_results),
+            }
+            try:
+                base["object_id"] = int(file_obj.getId())
+            except Exception:
+                pass
+
+            if bridge_error:
+                if str(bridge_error).startswith("SHORT_READ"):
+                    base.update({
+                        "status": "skipped",
+                        "error": bridge_error,
+                        "reason": (
+                            "Autopsy returned fewer bytes than the declared "
+                            "content size; no digest was accepted"
+                        ),
+                        "digest": "",
+                    })
+                else:
+                    base.update({"status": "error", "error": bridge_error, "digest": ""})
+                _record(self.job_id, base)
+                continue
+
+            if engine_result is None or engine_result.get("status") != "ok":
+                base.update({
+                    "status": "error",
+                    "error": str(engine_result.get("message", "engine error"))
+                    if engine_result else "engine error",
+                    "digest": "",
+                })
+                _record(self.job_id, base)
+                continue
+
+            digest = str(engine_result.get("digest", ""))
+            if actual != size_bytes or not _valid_digest(digest, 64):
+                base.update({
+                    "status": "error",
+                    "error": "byte-count/digest validation failed",
+                    "digest": "",
+                })
+                _record(self.job_id, base)
+                continue
+
+            base.update({
+                "status": "ok",
+                "error": "",
+                "digest": digest.lower(),
+                "engine_elapsed_ms": engine_result.get("elapsed_ms", 0.0),
+                "engine_throughput_mb_s": engine_result.get("throughput_mb_s", ""),
+                "cpu_utilization_percent": engine_result.get("cpu_utilization_percent", "N/A"),
+                "process_cpu_percent": engine_result.get("process_cpu_percent", "N/A"),
+                "peak_rss_mb": engine_result.get("peak_rss_mb", "N/A"),
+                "simd_tier": engine_result.get("simd_tier", "native runtime dispatch"),
+                "threads_used": engine_result.get("threads_used", ""),
+                "io_strategy": engine_result.get("io_strategy", "Autopsy batched IPC"),
+                "chunk_size": engine_result.get("chunk_size", _adaptive_buffer(size_bytes)),
+                "backend": engine_result.get("backend", "packaged native sidecar"),
+                "backend_version": engine_result.get("backend_version", ""),
+                "algorithm": engine_result.get("algorithm", "BLAKE3"),
+                "profile": engine_result.get("profile", "blake3_optimized"),
+            })
+            self._post_file_row(base, file_obj)
+
+    def _post_file_row(self, row, file_obj):
+        """Run comparison hashes, attach Autopsy checks, post artifact, record row.
+
+        This is the original post-hashing logic extracted into a helper so both
+        the single-file path and the batch-flush path share the same code.
+        """
+        if row["status"] == "ok":
+            integrity_sample, performance_sample = _claim_comparison_sample(
+                self.job_id,
+                row.get("category", "Other"),
+                row.get("size_bytes", 0),
+            )
+            run_comparison = integrity_sample or performance_sample
+            row["comparison_integrity_sample"] = bool(integrity_sample)
+            row["comparison_performance_sample"] = bool(performance_sample)
+            row["comparison_scope"] = (
+                "all-files" if COMPARE_EVERY_FILE else (
+                    "integrity+performance" if integrity_sample and performance_sample else (
+                        "performance" if performance_sample else (
+                            "integrity" if integrity_sample else "optimized-only"
+                        )
+                    )
+                )
+            )
+            if run_comparison:
+                comparison = _comparison_hashes(
+                    self.sidecar,
+                    file_obj,
+                    int(file_obj.getSize()),
+                    self.context,
+                    row.get("digest", ""),
+                )
+                row.update(comparison)
+                row["md5"] = comparison.get("md5_digest", "")
+                row["sha1"] = comparison.get("sha1_digest", "")
+                row["sha256"] = comparison.get("sha256_digest", "")
+            _attach_autopsy_hash_checks(row, file_obj)
+            if (
+                run_comparison
+                and row.get("baseline_blake3_status") == "ok"
+                and not row.get("baseline_blake3_matches")
+            ):
+                row["status"] = "error"
+                row["error"] = "BASELINE_BLAKE3_DIGEST_MISMATCH"
+
+        _record(self.job_id, row)
+        if row["status"] == "ok":
+            if POST_ALL_FILE_ARTIFACTS or row.get("comparison_scope") != "optimized-only":
+                _post_artifact(self.blackboard, file_obj, row)
+        elif row["status"] == "error":
+            self.services.postMessage(IngestMessage.createMessage(
+                IngestMessage.MessageType.ERROR,
+                MODULE_NAME,
+                "BLAKE3 failed for %s: %s" % (row["name"], row.get("error", "")),
+            ))
+
     def shutDown(self):
+        # Flush any partial batch before the sidecar process is closed.
+        if self._batch_queue:
+            remaining = self._batch_queue
+            self._batch_queue = []
+            try:
+                self._flush_batch(remaining)
+            except Exception:
+                pass
         _shutdown_module(self)
 
 
@@ -1173,13 +1548,19 @@ The engine executable SHA-256 above supports reproducibility and chain-of-custod
             MODULE_NAME,
             "BLAKE3 HTML and JSON reports saved: " + html_path,
         ))
+        return html_path
     except Exception as exc:
+        try:
+            print("BLAKE3 minimal report generation failed:\n" + traceback.format_exc())
+        except Exception:
+            pass
         try:
             IngestServices.getInstance().postMessage(IngestMessage.createMessage(
                 IngestMessage.MessageType.ERROR, MODULE_NAME, "Report generation failed: " + str(exc)
             ))
         except Exception:
             pass
+        return None
 
 
 def _format_bytes(byte_count):
@@ -1297,59 +1678,95 @@ def _algorithm_rows(file_rows, prefix):
     return [row for row in file_rows if row.get(prefix + "_status") == "ok"]
 
 
+def _empty_algorithm_totals(error=None):
+    """Zeroed totals shape, used whenever _algorithm_job_totals can't compute
+    a real answer -- keeps every downstream consumer (Executive Summary,
+    Speed Comparison row, _files_included_label, _format_speedup) working
+    against the same dict shape instead of raising further down the line."""
+    totals = {
+        "file_count": 0,
+        "includes_evidence": False,
+        "bytes": 0,
+        "elapsed_ms": 0.0,
+        "throughput_mb_s": 0.0,
+        "average_cpu": None,
+        "peak_rss": None,
+    }
+    if error is not None:
+        totals["error"] = str(error)
+    return totals
+
+
 def _algorithm_job_totals(file_rows, evidence, prefix):
     """Total bytes/time/CPU/RSS for one algorithm across every file it
     processed during this job, plus the evidence-source pass (when that
     algorithm also completed on the evidence source). Every algorithm is
     totaled the exact same way, so the numbers line up with each other and
-    with the Executive Summary's overall hashing-speed figure."""
-    rows_ok = _algorithm_rows(file_rows, prefix)
-    if prefix == "optimized":
-        elapsed_key = "end_to_end_elapsed_ms"
-        cpu_key = "cpu_utilization_percent"
-        rss_key = "peak_rss_mb"
-        evidence_ok = evidence.get("status") == "ok"
-    else:
-        elapsed_key = prefix + "_elapsed_ms"
-        cpu_key = prefix + "_cpu_utilization_percent"
-        rss_key = prefix + "_peak_rss_mb"
-        evidence_ok = evidence.get(prefix + "_status") == "ok"
+    with the Executive Summary's overall hashing-speed figure.
 
-    total_bytes = sum([int(row.get("size_bytes", 0)) for row in rows_ok])
-    total_elapsed = sum([_numeric(row, elapsed_key) or 0.0 for row in rows_ok])
-    cpu_values = [
-        value for value in [_numeric(row, cpu_key) for row in rows_ok]
-        if value is not None
-    ]
-    rss_values = [
-        value for value in [_numeric(row, rss_key) for row in rows_ok]
-        if value is not None
-    ]
-    file_count = len(rows_ok)
+    Never raises: any single malformed row (batch-mode or otherwise) is
+    excluded from the sums rather than aborting the whole report, since this
+    function's output feeds both the Executive Summary and every row of the
+    Speed Comparison table.
+    """
+    try:
+        rows_ok = _algorithm_rows(file_rows, prefix)
+        if prefix == "optimized":
+            elapsed_key = "end_to_end_elapsed_ms"
+            cpu_key = "cpu_utilization_percent"
+            rss_key = "peak_rss_mb"
+            evidence_ok = evidence.get("status") == "ok"
+        else:
+            elapsed_key = prefix + "_elapsed_ms"
+            cpu_key = prefix + "_cpu_utilization_percent"
+            rss_key = prefix + "_peak_rss_mb"
+            evidence_ok = evidence.get(prefix + "_status") == "ok"
 
-    if evidence_ok:
-        total_bytes += int(evidence.get("size_bytes", 0))
-        total_elapsed += _numeric(evidence, elapsed_key) or 0.0
-        evidence_cpu = _numeric(evidence, cpu_key)
-        evidence_rss = _numeric(evidence, rss_key)
-        if evidence_cpu is not None:
-            cpu_values.append(evidence_cpu)
-        if evidence_rss is not None:
-            rss_values.append(evidence_rss)
+        total_bytes = 0
+        total_elapsed = 0.0
+        cpu_values = []
+        rss_values = []
+        file_count = 0
+        for row in rows_ok:
+            try:
+                total_bytes += int(row.get("size_bytes", 0))
+                total_elapsed += _numeric(row, elapsed_key) or 0.0
+                cpu_value = _numeric(row, cpu_key)
+                if cpu_value is not None:
+                    cpu_values.append(cpu_value)
+                rss_value = _numeric(row, rss_key)
+                if rss_value is not None:
+                    rss_values.append(rss_value)
+                file_count += 1
+            except Exception:
+                # Skip just this one malformed row; still total the rest.
+                continue
 
-    rate = (
-        (float(total_bytes) / (1024.0 * 1024.0)) / (total_elapsed / 1000.0)
-        if total_elapsed > 0.0 else 0.0
-    )
-    return {
-        "file_count": file_count,
-        "includes_evidence": evidence_ok,
-        "bytes": total_bytes,
-        "elapsed_ms": total_elapsed,
-        "throughput_mb_s": rate,
-        "average_cpu": (sum(cpu_values) / len(cpu_values)) if cpu_values else None,
-        "peak_rss": max(rss_values) if rss_values else None,
-    }
+        if evidence_ok:
+            total_bytes += int(evidence.get("size_bytes", 0))
+            total_elapsed += _numeric(evidence, elapsed_key) or 0.0
+            evidence_cpu = _numeric(evidence, cpu_key)
+            evidence_rss = _numeric(evidence, rss_key)
+            if evidence_cpu is not None:
+                cpu_values.append(evidence_cpu)
+            if evidence_rss is not None:
+                rss_values.append(evidence_rss)
+
+        rate = (
+            (float(total_bytes) / (1024.0 * 1024.0)) / (total_elapsed / 1000.0)
+            if total_elapsed > 0.0 else 0.0
+        )
+        return {
+            "file_count": file_count,
+            "includes_evidence": evidence_ok,
+            "bytes": total_bytes,
+            "elapsed_ms": total_elapsed,
+            "throughput_mb_s": rate,
+            "average_cpu": (sum(cpu_values) / len(cpu_values)) if cpu_values else None,
+            "peak_rss": max(rss_values) if rss_values else None,
+        }
+    except Exception as exc:
+        return _empty_algorithm_totals(exc)
 
 
 def _files_included_label(totals):
@@ -1639,89 +2056,132 @@ def _generate_report(job_id):
             return digest + '<br><span class="badge badge-amber">AUTOPSY N/A</span>'
 
         for row in file_rows:
-            if row.get("baseline_blake3_matches") is True:
-                baseline_match = '<span class="badge badge-green">MATCH</span>'
-            elif row.get("baseline_blake3_status") == "ok":
-                baseline_match = '<span class="badge badge-red">MISMATCH</span>'
-            else:
-                baseline_match = '<span class="badge badge-amber">N/A</span>'
-            row_rss = _numeric(row, "peak_rss_mb")
-            detail_rows.append(
-                "<tr><td>%s</td><td>%s</td><td class='num'>%s</td>"
-                "<td class='digest'>%s</td><td class='digest'>%s</td>"
-                "<td>%s</td><td class='digest'>%s</td>"
-                "<td class='digest'>%s</td><td class='digest'>%s</td>"
-                "<td class='num'>%s</td>"
-                "<td class='num'>%s</td><td class='num'>%s</td>"
-                "<td class='num'>%s</td><td>%s</td></tr>" % (
-                    _cell(row, "name", "(unnamed)"),
-                    _cell(row, "category", "Other"),
-                    _cell(row, "size_bytes", "0"),
-                    _cell(row, "digest", "N/A"),
-                    _cell(row, "baseline_blake3_digest", "N/A"),
-                    baseline_match,
-                    reference_digest_cell(row, "md5"),
-                    reference_digest_cell(row, "sha1"),
-                    reference_digest_cell(row, "sha256"),
-                    _cell(row, "end_to_end_elapsed_ms", "N/A"),
-                    _cell(row, "throughput_mb_s", "N/A"),
-                    _cell(row, "cpu_utilization_percent", "N/A"),
-                    _format_mib(row_rss) if row_rss is not None else "N/A",
-                    _status_badge(row.get("status")),
+            # One malformed row (batch-mode or otherwise) must drop out of
+            # the audit log with a visible marker, not blank the report for
+            # every other file that hashed cleanly.
+            try:
+                if row.get("baseline_blake3_matches") is True:
+                    baseline_match = '<span class="badge badge-green">MATCH</span>'
+                elif row.get("baseline_blake3_status") == "ok":
+                    baseline_match = '<span class="badge badge-red">MISMATCH</span>'
+                else:
+                    baseline_match = '<span class="badge badge-amber">N/A</span>'
+                row_rss = _numeric(row, "peak_rss_mb")
+                name_cell = _cell(row, "name", "(unnamed)")
+                if row.get("batch_mode"):
+                    name_cell += (
+                        ' <span class="badge badge-amber" '
+                        'title="Timing distributed across a batched IPC round '
+                        'trip, not individually measured">BATCH-EST</span>'
+                    )
+                detail_rows.append(
+                    "<tr><td>%s</td><td>%s</td><td class='num'>%s</td>"
+                    "<td class='digest'>%s</td><td class='digest'>%s</td>"
+                    "<td>%s</td><td class='digest'>%s</td>"
+                    "<td class='digest'>%s</td><td class='digest'>%s</td>"
+                    "<td class='num'>%s</td>"
+                    "<td class='num'>%s</td><td class='num'>%s</td>"
+                    "<td class='num'>%s</td><td>%s</td></tr>" % (
+                        name_cell,
+                        _cell(row, "category", "Other"),
+                        _cell(row, "size_bytes", "0"),
+                        _cell(row, "digest", "N/A"),
+                        _cell(row, "baseline_blake3_digest", "N/A"),
+                        baseline_match,
+                        reference_digest_cell(row, "md5"),
+                        reference_digest_cell(row, "sha1"),
+                        reference_digest_cell(row, "sha256"),
+                        _cell(row, "end_to_end_elapsed_ms", "N/A"),
+                        _cell(row, "throughput_mb_s", "N/A"),
+                        _cell(row, "cpu_utilization_percent", "N/A"),
+                        _format_mib(row_rss) if row_rss is not None else "N/A",
+                        _status_badge(row.get("status")),
+                    )
                 )
-            )
+            except Exception as exc:
+                detail_rows.append(
+                    "<tr><td>%s</td><td colspan='13'>Row unavailable: %s</td></tr>"
+                    % (_escape(row.get("name", "(unnamed)")), _escape(str(exc)))
+                )
 
         def _file_algorithm_total_row(label, prefix, primary=False):
-            algorithm_rows = _algorithm_rows(file_rows, prefix)
-            if not algorithm_rows:
-                return ""
-            if prefix == "optimized":
-                elapsed_key = "end_to_end_elapsed_ms"
-                cpu_key = "cpu_utilization_percent"
-                rss_key = "peak_rss_mb"
-            else:
-                elapsed_key = prefix + "_elapsed_ms"
-                cpu_key = prefix + "_cpu_utilization_percent"
-                rss_key = prefix + "_peak_rss_mb"
-            total_bytes = sum([
-                int(row.get("size_bytes", 0)) for row in algorithm_rows
-            ])
-            total_elapsed = sum([
-                _numeric(row, elapsed_key) or 0.0 for row in algorithm_rows
-            ])
-            throughput = (
-                (float(total_bytes) / (1024.0 * 1024.0))
-                / (total_elapsed / 1000.0)
-                if total_elapsed > 0.0 else 0.0
-            )
-            cpu_values = [
-                value for value in [_numeric(row, cpu_key) for row in algorithm_rows]
-                if value is not None
-            ]
-            rss_values = [
-                value for value in [_numeric(row, rss_key) for row in algorithm_rows]
-                if value is not None
-            ]
-            row_class = " class='primary-row'" if primary else ""
-            return (
-                "<tr%s><td class='total-algorithm'>%s</td>"
-                "<td class='num'><strong>%d</strong></td>"
-                "<td class='num'><strong>%s</strong></td>"
-                "<td class='num'><strong>%s</strong></td>"
-                "<td class='num'><strong>%s</strong></td>"
-                "<td class='num'><strong>%s</strong></td>"
-                "<td class='num'><strong>%s</strong></td></tr>" % (
-                    row_class,
-                    _escape(label),
-                    len(algorithm_rows),
-                    total_bytes,
-                    _escape(_format_seconds(total_elapsed)),
-                    _escape(_format_rate(throughput)),
-                    ("%.2f %%" % (sum(cpu_values) / len(cpu_values)))
-                    if cpu_values else "N/A",
-                    _format_mib(max(rss_values)) if rss_values else "N/A",
+            # Isolated in its own try/except: a bad or unexpected value on any
+            # single row (batch-mode or otherwise) must degrade this one row
+            # to an error placeholder, never abort report generation for
+            # every other algorithm and the rest of the page.
+            try:
+                algorithm_rows = _algorithm_rows(file_rows, prefix)
+                if not algorithm_rows:
+                    return ""
+                if prefix == "optimized":
+                    elapsed_key = "end_to_end_elapsed_ms"
+                    cpu_key = "cpu_utilization_percent"
+                    rss_key = "peak_rss_mb"
+                else:
+                    elapsed_key = prefix + "_elapsed_ms"
+                    cpu_key = prefix + "_cpu_utilization_percent"
+                    rss_key = prefix + "_peak_rss_mb"
+                total_bytes = sum([
+                    int(row.get("size_bytes", 0)) for row in algorithm_rows
+                ])
+                total_elapsed = sum([
+                    _numeric(row, elapsed_key) or 0.0 for row in algorithm_rows
+                ])
+                throughput = (
+                    (float(total_bytes) / (1024.0 * 1024.0))
+                    / (total_elapsed / 1000.0)
+                    if total_elapsed > 0.0 else 0.0
                 )
-            )
+                cpu_values = [
+                    value for value in [_numeric(row, cpu_key) for row in algorithm_rows]
+                    if value is not None
+                ]
+                rss_values = [
+                    value for value in [_numeric(row, rss_key) for row in algorithm_rows]
+                    if value is not None
+                ]
+                batch_count = len([
+                    row for row in algorithm_rows if row.get("batch_mode")
+                ])
+                label_html = _escape(label)
+                if batch_count:
+                    # Forensic transparency: these rows' timing is a
+                    # proportional estimate distributed across one batched
+                    # IPC round trip (see _flush_batch), not individually
+                    # measured. Flag it on the total row so nobody mistakes
+                    # it for a direct per-file measurement.
+                    label_html += (
+                        ' <span class="badge badge-amber" title="Timing for '
+                        '%d of %d files is distributed across a batched IPC '
+                        'round trip, not individually measured">BATCH-EST</span>'
+                        % (batch_count, len(algorithm_rows))
+                    )
+                row_class = " class='primary-row'" if primary else ""
+                return (
+                    "<tr%s><td class='total-algorithm'>%s</td>"
+                    "<td class='num'><strong>%d</strong></td>"
+                    "<td class='num'><strong>%s</strong></td>"
+                    "<td class='num'><strong>%s</strong></td>"
+                    "<td class='num'><strong>%s</strong></td>"
+                    "<td class='num'><strong>%s</strong></td>"
+                    "<td class='num'><strong>%s</strong></td></tr>" % (
+                        row_class,
+                        label_html,
+                        len(algorithm_rows),
+                        total_bytes,
+                        _escape(_format_seconds(total_elapsed)),
+                        _escape(_format_rate(throughput)),
+                        ("%.2f %%" % (sum(cpu_values) / len(cpu_values)))
+                        if cpu_values else "N/A",
+                        _format_mib(max(rss_values)) if rss_values else "N/A",
+                    )
+                )
+            except Exception as exc:
+                return (
+                    "<tr><td class='total-algorithm'>%s</td>"
+                    "<td class='num' colspan='5'>Totals unavailable: %s</td></tr>"
+                    % (_escape(label), _escape(str(exc)))
+                )
 
         total_rows_html = "".join([
             _file_algorithm_total_row("Optimized BLAKE3", "optimized", True),
@@ -2292,14 +2752,43 @@ section{margin-top:22px}
         _show_report_popup(html_path)
         return html_path
     except Exception as exc:
+        # str(exc) alone is often just a bare key/attribute name and doesn't
+        # say where in the ~700-line report body it happened. Log the full
+        # traceback so a future failure is diagnosable from Autopsy's own
+        # logs (Help -> Open Log Folder) instead of guessing again.
+        trace_text = traceback.format_exc()
+        try:
+            print("BLAKE3 styled report generation failed:\n" + trace_text)
+        except Exception:
+            pass
         try:
             IngestServices.getInstance().postMessage(
                 IngestMessage.createMessage(
                     IngestMessage.MessageType.ERROR,
                     MODULE_NAME,
-                    "Failed to generate styled BLAKE3 report: " + str(exc),
+                    "Failed to generate styled BLAKE3 report: " + str(exc)
+                    + " -- full traceback written to the Autopsy log. "
+                    "Falling back to the minimal report.",
                 )
             )
         except Exception:
             pass
-        return None
+        # Guaranteed fallback: the styled report has many moving parts (HTML
+        # template, per-algorithm totals, per-file table). The minimal report
+        # below only depends on the same flat "rows" list already recorded
+        # during ingest, so it succeeds independently of whatever broke above
+        # -- the job should never end with zero reports on disk.
+        try:
+            return _generate_report_minimal(job_id)
+        except Exception as fallback_exc:
+            try:
+                IngestServices.getInstance().postMessage(
+                    IngestMessage.createMessage(
+                        IngestMessage.MessageType.ERROR,
+                        MODULE_NAME,
+                        "Minimal fallback report also failed: " + str(fallback_exc),
+                    )
+                )
+            except Exception:
+                pass
+            return None

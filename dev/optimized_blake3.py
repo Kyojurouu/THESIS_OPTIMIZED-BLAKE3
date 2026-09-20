@@ -47,7 +47,11 @@ except ImportError:  # Metrics still work, with a documented RSS fallback.
 
 
 MIB = 1024 * 1024
-SMALL_FILE_LIMIT = 16 * MIB
+# Below this threshold the native thread-pool startup cost outweighs any
+# benefit, so small files use a single thread.  Also controls the per-file
+# multithreading gate in select_policy() and hash_many().
+# Override with BLAKE3_SMALL_FILE_LIMIT (bytes) for testing.
+SMALL_FILE_LIMIT = int(os.environ.get("BLAKE3_SMALL_FILE_LIMIT", str(32 * MIB)))
 MMAP_MIN_BYTES = 64 * MIB
 KNOWN_VECTORS = {
     b"": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
@@ -109,18 +113,24 @@ def logical_cpu_count() -> int:
 
 
 def adaptive_chunk_size(size_bytes: int) -> int:
-    """Choose a reusable I/O buffer; BLAKE3's internal chunk is still 1 KiB."""
-    if size_bytes < 1 * MIB:
+    """Choose a reusable I/O buffer; BLAKE3's internal chunk is still 1 KiB.
+
+    Adjacent tiers differ by at most 4× to avoid pipeline starvation at tier
+    boundaries (the previous implementation had an 8× jump from 256 KiB to
+    2 MiB at the old 16 MiB threshold).  Larger buffers amortise the
+    Python→C call overhead; too-large buffers evict useful data from L3 cache.
+    """
+    if size_bytes < 512 * 1024:       # < 512 KiB  — tiny files
         return 64 * 1024
-    if size_bytes < SMALL_FILE_LIMIT:
+    if size_bytes < 4 * MIB:          # 512 KiB – 4 MiB — small
         return 256 * 1024
-    if size_bytes < 64 * MIB:
+    if size_bytes < SMALL_FILE_LIMIT:  # 4 MiB – SMALL_FILE_LIMIT — medium
+        return 512 * 1024
+    if size_bytes < 128 * MIB:        # SMALL_FILE_LIMIT – 128 MiB — large
         return 2 * MIB
-    if size_bytes < 256 * MIB:
+    if size_bytes < 1024 * MIB:       # 128 MiB – 1 GiB — very large
         return 8 * MIB
-    if size_bytes < 2 * 1024 * MIB:
-        return 8 * MIB
-    return 16 * MIB
+    return 16 * MIB                   # ≥ 1 GiB — bulk
 
 
 def select_policy(
@@ -665,7 +675,21 @@ def serve_forever(
     *,
     threads: Optional[int] = None,
 ) -> int:
-    """Run the Autopsy length-prefixed protocol until clean EOF."""
+    """Run the Autopsy length-prefixed protocol until clean EOF.
+
+    Supports two request formats on the same persistent connection:
+
+    Legacy single-file::
+
+        {"size": N, "profile": "blake3_optimized"}\n  (followed by N raw bytes)
+        → one JSON result line
+
+    Batch (N files, zero extra round-trips)::
+
+        {"batch": M, "requests": [{"size": s0, "profile": p0}, ...]}\n
+        (followed by s0 + s1 + … raw bytes, back-to-back)
+        → M JSON result lines written in one flush
+    """
     source = input_stream or sys.stdin.buffer
     sink = output_stream or sys.stdout.buffer
     while True:
@@ -674,26 +698,74 @@ def serve_forever(
             return 0
         try:
             stripped = header.strip()
-            if stripped.startswith(b"{"):
-                request = json.loads(stripped.decode("utf-8"))
+            if not stripped.startswith(b"{"):
+                # Legacy plain-integer protocol.
+                _serve_single(source, sink, int(stripped), "blake3_optimized", threads)
+                continue
+            request = json.loads(stripped.decode("utf-8"))
+            if "batch" in request:
+                _serve_batch(source, sink, request, threads)
+            else:
                 size_bytes = int(request["size"])
                 profile = str(request.get("profile", "blake3_optimized"))
-            else:
-                size_bytes = int(stripped)
-                profile = "blake3_optimized"
-            if size_bytes < 0:
-                raise ValueError("negative byte count")
-            result = hash_stream_profile(
-                source,
-                size_bytes,
-                profile=profile,
-                threads=threads,
-            )
-            payload = result.to_dict()
+                _serve_single(source, sink, size_bytes, profile, threads)
         except Exception as exc:
             payload = {"status": "error", "message": str(exc), "bytes_read": 0}
-        sink.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
-        sink.flush()
+            sink.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+            sink.flush()
+
+
+def _serve_single(
+    source: BinaryIO,
+    sink: BinaryIO,
+    size_bytes: int,
+    profile: str,
+    threads: Optional[int],
+) -> None:
+    """Handle one legacy request and write one JSON result line."""
+    if size_bytes < 0:
+        raise ValueError("negative byte count")
+    result = hash_stream_profile(source, size_bytes, profile=profile, threads=threads)
+    sink.write((json.dumps(result.to_dict(), sort_keys=True) + "\n").encode("utf-8"))
+    sink.flush()
+
+
+def _serve_batch(
+    source: BinaryIO,
+    sink: BinaryIO,
+    batch_header: Dict[str, Any],
+    threads: Optional[int],
+) -> None:
+    """Handle a batch request; write N JSON result lines in one flush.
+
+    The client sends all file bytes back-to-back immediately after the header.
+    Results are emitted in the same order so the client correlates by position.
+    A single ``sink.flush()`` at the end is the key IPC saving: the sidecar
+    does *not* flush after every individual result.
+    """
+    count = int(batch_header.get("batch", 0))
+    requests = list(batch_header.get("requests", []))
+    if len(requests) != count:
+        raise ValueError(
+            "batch count mismatch: header says %d, requests has %d" % (count, len(requests))
+        )
+    result_lines: List[bytes] = []
+    for req in requests:
+        size_bytes = int(req.get("size", 0))
+        profile = str(req.get("profile", "blake3_optimized"))
+        if size_bytes < 0:
+            payload: Dict[str, Any] = {
+                "status": "error",
+                "message": "negative byte count",
+                "bytes_read": 0,
+            }
+        else:
+            result = hash_stream_profile(source, size_bytes, profile=profile, threads=threads)
+            payload = result.to_dict()
+        result_lines.append((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+    # Write all N result lines then flush exactly once.
+    sink.write(b"".join(result_lines))
+    sink.flush()
 
 
 def _benchmark(paths: Sequence[str], rounds: int, threads: Optional[int]) -> Dict[str, Any]:
