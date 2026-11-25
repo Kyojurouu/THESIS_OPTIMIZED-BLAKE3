@@ -94,15 +94,18 @@ pip install -r requirements.txt
 python main_app.py
 ```
 
-Hash Files (with `.b3` hash lists and re-checking), File Analysis, System Overview and Methodology
-are always available. Evaluation mode adds Technique Evaluation (C0, C1, C3, C4 on local files
-with R1/R2), Batch Processing (batching and parallel dispatch of many small local files),
-Correctness Verification (V1–V3, H1–H4) and Test Dataset. Both evaluation pages use the
-Section 3.5 statistics. For local files of 32 MiB and above on SSD/NVMe storage the app's
-adaptive buffer is a memory map (Section 3.4: "the mmap module provides memory-mapped access to
-large local files"); on HDDs, network shares, or when mapping fails it reads with the Table 7
-buffer. Peak memory of mapped runs includes the mapped file pages (shared, reclaimable file
-cache), not only allocated memory.
+Five pages, all visible:
+
+| Page | What it is for |
+|---|---|
+| **Hash Files** | Hash files or folders with Optimized BLAKE3 (optional Standard BLAKE3, SHA-256, MD5); save a `.b3` hash list and CSV/JSON report; re-check files against a saved list. |
+| **Technique Evaluation** | Each optimization on its own and together (Table 8: C0, C1 buffer sizing only, C2 batching only, C3 threading only, C4 all, R1 MD5, R2 SHA-256) on a set of evidence files, through the same engine data stream as the Autopsy module; rotated order, 30 trials, Section 3.5 statistics, speed by file size. |
+| **Correctness Verification** | V1–V3 correctness checks and the H1–H4 hash-behaviour tests. |
+| **Overview** | The three techniques, the configurations, what is kept constant, this computer. |
+| **Methodology** | Equations 1–19 and the statistical analysis plan (exportable as Markdown). |
+
+Native SIMD is chosen automatically by the BLAKE3 library and is identical in every configuration;
+it is not a studied technique (Section 1.5), so there is no "SIMD only" configuration.
 
 ## Command line
 
@@ -112,8 +115,7 @@ python optimized_blake3.py FILE_OR_FOLDER [...] [--extra blake3_standard sha256]
 python optimized_blake3.py --check ../results/hashes_YYYYMMDD_HHMMSS.b3
 python optimized_blake3.py --self-test
 python benchmark_blake3.py autopsy TRIALS_CSV --output ../results
-python benchmark_blake3.py large FILE [FILE ...] --trials 30 --output ../results
-python benchmark_blake3.py small FOLDER --trials 30 --output ../results
+python benchmark_blake3.py trials FILES_OR_FOLDERS --trials 30 --output ../results
 python blake3_validation.py [optional-file] --output verification.json
 python dataset_tool.py manifest ../digital_evidence_dataset
 python -m pytest -q tests

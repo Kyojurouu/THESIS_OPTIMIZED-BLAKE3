@@ -2,10 +2,9 @@
 
 Pages (left sidebar)
 --------------------
-HASHING      Hash Files · File Analysis
-EVALUATION   Technique Evaluation · Batch Processing
-VALIDATION   Correctness Verification · Test Dataset
-SYSTEM       System Overview · Methodology
+HASHING      Hash Files
+EVALUATION   Technique Evaluation (thesis Table 8) · Correctness Verification
+ABOUT        Overview · Methodology
 
 All computation lives in the ``dev`` package; this file is presentation only.
 The interface is plain Tkinter with a small design system (colour tokens,
@@ -37,58 +36,34 @@ if str(_MODULE_DIR) not in sys.path:
 
 
 from benchmark_blake3 import (                                    # noqa: E402
-    DEFAULT_TRIALS,
     FORMULAS,
     STATISTICAL_PLAN,
-    DEFAULT_WARMUPS,
-    MIN_TRIALS,
     export_report,
     planned_read_bytes,
-    run_large_file_ablation,
-    run_small_file_ablation,
+    run_configuration_trials,
 )
 from blake3_validation import (                                   # noqa: E402
     LIMITATIONS,
-    avalanche_test,
-    collision_test,
-    deterministic_test,
-    distribution_test,
-    optimized_digest,
     run_validation,
 )
-from dataset_tool import (                                        # noqa: E402
-    DEFAULT_SWEEP_SIZES,
-    SIZE_TIERS,
-    build_manifest,
-    format_size,
-    generate_size_sweep,
-    generate_small_file_corpus,
-    size_tier,
-    verify_manifest,
-    write_manifest,
-)
+from dataset_tool import format_size, size_tier                   # noqa: E402
 from optimized_blake3 import (                                    # noqa: E402
-    DEFAULT_BATCH_SIZE,
+    BATCH_WINDOW,
     MIB,
     SMALL_FILE_LIMIT,
+    TABLE8_CONFIGURATIONS,
     THESIS_TITLE,
     TOOL_NAME,
     TOOL_SHORT_NAME,
     TOOL_SUBTITLE,
     OperationCancelled,
-    benchmark_memory,
-    hash_paths,
-    verify_hash_list,
-    write_hash_report,
     detected_simd_tier,
-    hash_file,
-    load_file_snapshot,
-    logical_cpu_count,
+    hash_paths,
     make_worker_pool,
     physical_cpu_count,
-    recommended_memory_benchmark_limit,
-    storage_profile,
     system_summary,
+    verify_hash_list,
+    write_hash_report,
 )
 
 RESULTS_DIR = _ROOT / "results"
@@ -759,8 +734,7 @@ class _Tab(tk.Frame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HashFilesTab(_Tab):
-    _ALGO_COLUMNS = (("blake3_standard", "Standard BLAKE3"), ("sha256", "SHA-256"),
-                     ("sha1", "SHA-1"), ("md5", "MD5"))
+    _ALGO_COLUMNS = (("blake3_standard", "Standard BLAKE3"), ("sha256", "SHA-256"), ("md5", "MD5"))
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
@@ -770,8 +744,8 @@ class HashFilesTab(_Tab):
         self._shown: set = set()       # paths that have a row in the table
         self._report: Optional[Dict[str, Any]] = None
         _heading(self.body, "Hash Files",
-                 "Fingerprint evidence with Optimized BLAKE3: adaptive buffering (large files are "
-                 "memory-mapped), multithreading on every core, and batching for sets of small files.",
+                 "Fingerprint evidence with Optimized BLAKE3: adaptive buffer sizing, batching of small "
+                 "files, and multithreading of large files on the physical CPU cores.",
                  eyebrow="Hashing")
 
         # Hero: add evidence
@@ -809,8 +783,7 @@ class HashFilesTab(_Tab):
             "blake3_standard": ("Standard BLAKE3", "same algorithm without the optimizations; shows "
                                 "identical hashes and the speed difference"),
             "sha256": ("SHA-256", "for reports and tools that use it"),
-            "sha1": ("SHA-1", "legacy, for older references"),
-            "md5": ("MD5", "legacy, for older references"),
+            "md5": ("MD5", "for older references and hash sets"),
         }
         for index, (key, _label) in enumerate(self._ALGO_COLUMNS):
             var = tk.BooleanVar(value=False)
@@ -1225,262 +1198,26 @@ class HashFilesTab(_Tab):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File Analysis
+# Technique Evaluation (thesis Table 8)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class FileAnalysisTab(_Tab):
-    _AVALANCHE_SAMPLES = 1000
-    _AVALANCHE_BYTES = 64 * 1024
-    _COLLISION_VARIANTS = 300
-    _REPETITIONS = 10
-    _BENCHMARK_REPEATS = 7
-    _BENCHMARK_WARMUPS = 2
-    _MODES = {
-        "Physical cores (optimized threading)": "optimized",
-        "One thread (baseline threading)": "baseline",
-    }
-
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-        _heading(self.body, "File Analysis",
-                 "Look closely at one file: its fingerprint, in-memory BLAKE3 speed, and how the hash "
-                 "behaves. For controlled baseline-vs-optimized comparisons use Technique Evaluation.",
-                 eyebrow="Hashing")
-        pick = _section(self.body, "Evidence file", step=1)
-        row = frame(pick)
-        row.pack(fill="x")
-        self._path_var = tk.StringVar()
-        entry(row, self._path_var).pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
-        FlatButton(row, "Browse…", self._browse).pack(side="left", padx=(0, 8))
-        self._run_btn = FlatButton(row, "Analyze file", self._start, kind="primary")
-        self._run_btn.pack(side="left")
-        opt = frame(pick)
-        opt.pack(fill="x", pady=(12, 0))
-        _cap(opt, "In-memory speed measured with").pack(side="left")
-        self._mode_var = tk.StringVar(value=next(iter(self._MODES)))
-        ttk.Combobox(opt, textvariable=self._mode_var, values=list(self._MODES), width=40,
-                     state="readonly").pack(side="left", padx=10)
-        self._progress = ProgressPanel(pick)
-        self._progress.pack(fill="x", pady=(14, 0))
-
-        self._tiles = tile_row(self.body, ["Median in-memory time", "In-memory throughput",
-                                           "File size", "Worker threads"])
-        fp = _section(self.body, "Fingerprint", "BLAKE3-256 digest of the complete file", step=2)
-        digest_row = frame(fp, bg="surface_alt", highlightbackground=P["border"], highlightthickness=1)
-        digest_row.pack(fill="x")
-        self._digest_var = tk.StringVar(value="The file's BLAKE3 hash will appear here")
-        tk.Entry(digest_row, textvariable=self._digest_var, state="readonly", font=F["mono_lg"],
-                 readonlybackground=P["surface_alt"], fg=P["accent"], relief="flat",
-                 highlightthickness=0).pack(side="left", fill="x", expand=True, padx=14, ipady=10)
-        FlatButton(digest_row, "Copy", self._copy, kind="primary", size="sm").pack(side="left", padx=10)
-        self._perf_note = tk.StringVar(value="File loading is excluded from the timer.")
-        tk.Label(fp, textvariable=self._perf_note, bg=P["surface"], fg=P["muted"], font=F["small"],
-                 anchor="w", justify="left", wraplength=980).pack(fill="x", pady=(10, 0))
-
-        diag = _section(self.body, "Hash behaviour",
-                        "The Section 3.5 tests applied to this file, through the optimized engine. "
-                        "Supporting observations, not proofs of security.", step=3)
-        self._diag = _table(diag, [
-            ("check", "Check", 260, "w"), ("result", "Result", 130, "w"),
-            ("observed", "Observed", 340, "w"), ("expected", "Expected", 290, "w"),
-        ], height=6)
-        self._scope_var = tk.StringVar(value="")
-        tk.Label(diag, textvariable=self._scope_var, bg=P["surface"], fg=P["muted"], font=F["small"],
-                 anchor="w", justify="left", wraplength=980).pack(fill="x", pady=(10, 0))
-        self.finish_page()
-
-    def _browse(self):
-        path = filedialog.askopenfilename(title="Select a file to analyse")
-        if path:
-            self._path_var.set(path)
-
-    def _copy(self):
-        digest = self._digest_var.get()
-        if len(digest) == 64:
-            self.clipboard_clear()
-            self.clipboard_append(digest)
-            self.status("Hash copied to the clipboard")
-
-    def _start(self):
-        if self.guard_busy():
-            return
-        path = self._path_var.get().strip()
-        if not os.path.isfile(path):
-            messagebox.showwarning("No file", "Select a valid file first.")
-            return
-        mode = self._MODES[self._mode_var.get()]
-        self.busy = True
-        self._run_btn.configure(state="disabled")
-        self._digest_var.set("Hashing…")
-        for tile in self._tiles:
-            tile.set("…")
-        self._diag.delete(*self._diag.get_children())
-        BackgroundTask(self, lambda progress, cancel: self._work(path, mode, progress),
-                       on_progress=self._progress.update_progress,
-                       on_done=self._done, on_error=self._error)
-        self._progress.start(None, "Loading file into RAM (not timed)…")
-        self.status("File analysis running…")
-
-    def _work(self, path: str, mode: str, progress) -> Dict[str, Any]:
-        initial = Path(path).stat()
-        threads = 1 if mode == "baseline" else physical_cpu_count()
-        progress("Loading file into RAM (not timed)…", 0.05)
-        try:
-            snapshot = load_file_snapshot(path, max_bytes=recommended_memory_benchmark_limit())
-        except MemoryError:
-            snapshot = load_file_snapshot(path, max_bytes=min(int(initial.st_size), 64 * MIB))
-        digest = ""
-        if not snapshot.complete:
-            progress("Computing full-file digest…", 0.15)
-            total = max(1, int(initial.st_size))
-            result = hash_file(path, expected_size=int(initial.st_size), progress=throttled(
-                lambda done: progress("Computing full-file digest… %s of %s" % (
-                    format_size(done), format_size(total)), 0.15 + 0.15 * done / total)))
-            if result.status != "ok":
-                raise RuntimeError(result.error or "hashing failed")
-            digest = result.digest
-        progress("Measuring in-memory BLAKE3 speed…", 0.3)
-        bench = benchmark_memory(snapshot.data, threads=threads,
-                                 repeats=self._BENCHMARK_REPEATS, warmups=self._BENCHMARK_WARMUPS)
-        if snapshot.complete:
-            digest = bench.digest
-        sample = bytes(memoryview(snapshot.data)[:4 * MIB])
-        del snapshot
-        progress("Deterministic output (×%d)…" % self._REPETITIONS, 0.45)
-        determinism = deterministic_test([sample], repetitions=self._REPETITIONS)
-        head = sample[:self._AVALANCHE_BYTES]
-        progress("Avalanche effect (%d single-bit flips)…" % self._AVALANCHE_SAMPLES, 0.6)
-        avalanche = avalanche_test([head] * self._AVALANCHE_SAMPLES) if head else {"applicable": False}
-        progress("Collision and distribution tests…", 0.8)
-        digests = [optimized_digest(head + index.to_bytes(8, "little"))
-                   for index in range(self._COLLISION_VARIANTS)]
-        collisions = collision_test(digests)
-        balance = distribution_test(digests)
-        final = Path(path).stat()
-        if final.st_size != initial.st_size or final.st_mtime_ns != initial.st_mtime_ns:
-            raise RuntimeError("The evidence file changed during analysis")
-        return {"path": path, "size": int(initial.st_size), "digest": digest, "bench": bench,
-                "complete": bench.bytes_hashed == initial.st_size,
-                "avalanche": avalanche, "collisions": collisions, "balance": balance,
-                "determinism": determinism}
-
-    def _done(self, result):
-        self.busy = False
-        self._run_btn.configure(state="normal")
-        bench = result["bench"]
-        self._digest_var.set(result["digest"])
-        self._tiles[0].set(fmt_ms(bench.median_elapsed_ms), "median of %d trials" % bench.repeats)
-        self._tiles[1].set("%.0f MiB/s" % bench.median_throughput_mib_s,
-                           "range %.0f–%.0f" % (bench.min_throughput_mib_s, bench.max_throughput_mib_s))
-        self._tiles[2].set(format_size(result["size"]), size_tier(result["size"]))
-        self._tiles[3].set(str(bench.threads_used), "native BLAKE3 threads")
-        scope = ("complete file" if result["complete"] else
-                 "first %s of %s (full-file digest computed separately)"
-                 % (format_size(bench.bytes_hashed), format_size(result["size"])))
-        self._perf_note.set("In-memory median of %d trials after %d warm-ups over the %s. File loading "
-                            "is excluded from the timer." % (bench.repeats, bench.warmups, scope))
-        a, c, b, d = (result["avalanche"], result["collisions"], result["balance"],
-                      result["determinism"])
-        rows = [("Same hash every time (Eq. 16)", d["passed"],
-                 "D = %.1f %% over %d repetitions" % (d["deterministic_percent"], d["repetitions"]),
-                 "100 %")]
-        if a.get("applicable"):
-            rows.append(("One-bit change alters about half the hash (Eq. 13)", a["passed"],
-                         "AE = %.2f %% over %d flips" % (a["mean_avalanche_percent"], a["inputs"]),
-                         "close to 50 %"))
-        else:
-            rows.append(("Avalanche (Eq. 13)", None, "not applicable (empty file)", "—"))
-        rows += [
-            ("No collisions (Eq. 15)", c["passed"],
-             "%d collisions among %d digests (CR %.2g)" % (c["collisions_found"], c["digests_compared"],
-                                                          c["collision_rate"]), "0 collisions"),
-            ("Uniform digest bytes (Eq. 14)", b["passed"],
-             "χ² = %.1f, p = %s" % (b["chi_square"], fmt_p(b["p_value"])), "not significant (p ≥ 0.05)"),
-        ]
-        for name, passed, observed, expected in rows:
-            text = "n/a" if passed is None else ("✔ As expected" if passed else "✘ Unusual")
-            tags = () if passed is None else (("pass",) if passed else ("fail",))
-            tree_insert(self._diag, (name, text, observed, expected), tags)
-        self._scope_var.set(
-            "Determinism: %s. Avalanche, collision and distribution: the first 64 KiB and %d indexed "
-            "variants of it. The full protocol (1,000 random inputs, 10,000 digests) is on the Correctness "
-            "Verification page. %s" % (
-                "entire file" if result["size"] <= 4 * MIB else "first 4 MiB",
-                self._COLLISION_VARIANTS, LIMITATIONS))
-        self._progress.finish("Analysis complete")
-        self.status("Analysis complete for %s" % Path(result["path"]).name)
-
-    def _error(self, message, trace):
-        self.busy = False
-        self._run_btn.configure(state="normal")
-        self._digest_var.set("Error")
-        self._progress.finish("Failed: " + message)
-        self.report_error(message, trace)
+_CONFIGURATION_HELP = {
+    "C0": "Baseline: fixed 1 MiB buffer, one thread, one request per file. Everything is compared with it.",
+    "C1": "Only buffer sizing: the buffer follows file size (Table 7: 64 KiB to 16 MiB).",
+    "C2": "Only batching: files below 32 MiB are sent up to 32 per request.",
+    "C3": "Only multithreading: files of 32 MiB and above use the physical CPU cores.",
+    "C4": "All three techniques together (the optimized implementation).",
+    "R1": "MD5 with a fixed 1 MiB buffer — reference point only.",
+    "R2": "SHA-256 with a fixed 1 MiB buffer — reference point only.",
+}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared experiment controls
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _TrialControls(tk.Frame):
-    PRESETS = (("Preliminary", "10 trials", 10, 1), ("Standard protocol", "30 trials", 30, 2))
-
-    def __init__(self, parent, default_trials=DEFAULT_TRIALS):
-        super().__init__(parent, bg=P["surface"])
-        _cap(self, "Measurement preset").pack(anchor="w")
-        chips = frame(self)
-        chips.pack(fill="x", pady=(6, 0))
-        self._chips: List[FlatButton] = []
-        for index, (name, detail, trials, warmups) in enumerate(self.PRESETS):
-            chip = FlatButton(chips, "%s · %s" % (name, detail),
-                              lambda i=index: self._select(i), kind="chip_off")
-            chip.pack(side="left", padx=(0, 8))
-            self._chips.append(chip)
-        custom = frame(chips)
-        custom.pack(side="left", padx=(12, 0))
-        _cap(custom, "Trials").pack(side="left")
-        self.trials = tk.IntVar(value=default_trials)
-        spinbox(custom, self.trials, from_=MIN_TRIALS, to=200, increment=5, width=5).pack(
-            side="left", padx=(6, 14), ipady=3)
-        _cap(custom, "Warm-ups").pack(side="left")
-        self.warmups = tk.IntVar(value=DEFAULT_WARMUPS)
-        spinbox(custom, self.warmups, from_=0, to=10, width=4).pack(side="left", padx=6, ipady=3)
-        self._hint = tk.StringVar()
-        tk.Label(self, textvariable=self._hint, bg=P["surface"], fg=P["muted"], font=F["small"],
-                 anchor="w").pack(anchor="w", pady=(6, 0))
-        self._select(1 if default_trials >= 30 else 0)
-
-    def _select(self, index: int):
-        name, _detail, trials, warmups = self.PRESETS[index]
-        self.trials.set(trials)
-        self.warmups.set(warmups)
-        for i, chip in enumerate(self._chips):
-            chip.set_kind("chip_on" if i == index else "chip_off")
-        self._hint.set("Preliminary: a shorter run for exploratory checks; results are flagged as "
-                       "preliminary." if index == 0 else
-                       "Standard protocol: 30 measured trials after 2 excluded warm-ups, as defined in the "
-                       "statistical analysis plan.")
-
-    def select_quick(self):
-        self._select(0)
-
-    def values(self) -> Optional[Tuple[int, int]]:
-        try:
-            trials, warmups = int(self.trials.get()), int(self.warmups.get())
-        except (TypeError, ValueError, tk.TclError):
-            messagebox.showerror("Invalid settings", "Trials and warm-ups must be whole numbers.")
-            return None
-        if trials < MIN_TRIALS:
-            messagebox.showerror("Too few trials",
-                                 "Use at least %d measured trials (30 recommended)." % MIN_TRIALS)
-            return None
-        return trials, max(0, warmups)
-
-
-def _comparison_row_values(name, item, comparison, *, reference=False):
+def _comparison_row_values(name, item, comparison, *, reference_speedup=None):
     stats = item["elapsed_ms"]
     if comparison is None:
-        speed, ci, change, p, delta, verdict = "1.00× (baseline)", "—", "—", "—", "—", "Reference point"
+        verdict = "Baseline" if reference_speedup is None else "Reference point"
+        speed = "1.00×" if reference_speedup is None else fmt_speedup(reference_speedup)
+        ci = change = p = delta = "—"
     else:
         speed = fmt_speedup(comparison["speedup"])
         ci = fmt_ci(comparison["speedup_ci95"])
@@ -1489,7 +1226,7 @@ def _comparison_row_values(name, item, comparison, *, reference=False):
                          "t" if comparison.get("test") == "paired t-test" else "W")
         delta = ("%.2f (%s)" % (comparison["cohens_d"], comparison["effect_magnitude"])
                  if comparison.get("cohens_d") is not None else "—")
-        verdict = verdict_text(comparison["verdict"], reference)
+        verdict = verdict_text(comparison["verdict"])
     return (
         name, verdict, fmt_ms(stats["mean"]), fmt_ci(stats["ci95"], "%.2f"),
         fmt_num(stats["cv_percent"], "%.1f %%"), fmt_num(item["throughput_mib_s"]["mean"], "%.0f"),
@@ -1499,20 +1236,19 @@ def _comparison_row_values(name, item, comparison, *, reference=False):
 
 
 _RESULT_COLUMNS = [
-    ("config", "Configuration", 260, "w"), ("verdict", "Result", 190, "w"),
-    ("median", "Mean", 85, "e"), ("ci", "95% CI (ms)", 135, "e"), ("cv", "CV", 60, "e"),
+    ("config", "Configuration", 250, "w"), ("verdict", "Result vs C0", 170, "w"),
+    ("mean", "Mean time", 90, "e"), ("ci", "95% CI (ms)", 135, "e"), ("cv", "CV", 60, "e"),
     ("thr", "MiB/s", 65, "e"), ("cpu", "CPU", 65, "e"), ("rss", "Peak MiB", 75, "e"),
-    ("speed", "Speedup", 110, "e"), ("sci", "Speedup CI", 115, "e"),
-    ("change", "Time Δ", 75, "e"), ("p", "p Holm (test)", 95, "e"), ("delta", "Effect d", 120, "w"),
+    ("speed", "Speedup", 90, "e"), ("sci", "Speedup CI", 115, "e"),
+    ("change", "Time Δ", 75, "e"), ("p", "p Holm (test)", 100, "e"), ("delta", "Effect d", 120, "w"),
 ]
 
 _GLOSSARY = (
-    "Mean and 95% CI: Eq. 7 and 9 (t critical value).  CV: Eq. 10 (≤ 10 % is stable).  "
-    "Speedup: mean baseline time ÷ mean configuration time (Eq. 3).  p Holm (test): Holm-corrected p of "
-    "the paired t-test (t) when Shapiro–Wilk finds the paired differences normal, otherwise the Wilcoxon "
-    "signed-rank test (W).  Effect d: mean paired difference ÷ its SD (Eq. 18).  '✔ Faster' needs "
-    "p Holm < 0.05 with a positive mean difference.  Speedup CI: range implied by the 95 % CI of the "
-    "mean paired difference."
+    "Mean time: all files hashed once (Eq. 2, 7); 95% CI uses the t critical value (Eq. 9); CV (Eq. 10) "
+    "above 10 % means the computer was busy — re-run.  Speedup = C0 mean ÷ configuration mean (Eq. 3).  "
+    "p Holm (test): Holm-corrected p of the paired t-test (t) when the paired differences are normal "
+    "(Shapiro–Wilk), otherwise the Wilcoxon signed-rank test (W).  Effect d: Eq. 18.  "
+    "'✔ Faster' means p Holm < 0.05.  MD5 and SHA-256 are reference points and are not tested."
 )
 
 
@@ -1522,112 +1258,147 @@ def _tone_for(comparison: Optional[Dict[str, Any]]) -> str:
     return _VERDICT_TONE.get(comparison["verdict"], "neutral")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Technique Evaluation (large files)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class TechniqueBenchmarkTab(_Tab):
+    PRESETS = (("Quick check", 5), ("Thesis protocol", 30))
+
     def __init__(self, parent, app):
         super().__init__(parent, app)
         self._files: List[str] = []
-        self._report: Optional[Dict[str, Any]] = None
         _heading(self.body, "Technique Evaluation",
-                 "Large files, 2×2 experiment: adaptive buffering (on/off) × multithreading (on/off). "
-                 "Every configuration runs once per round in random order and is compared with Baseline "
-                 "BLAKE3 (fixed 1 MiB buffer, one thread).", eyebrow="Evaluation")
+                 "Measures each optimization on its own and all together (thesis Table 8). Every "
+                 "configuration hashes the same files through the same engine and data stream as the "
+                 "Autopsy module; only the buffer size, batching and threading change. Native SIMD "
+                 "(%s) is the same in every configuration." % detected_simd_tier().split(" (")[0],
+                 eyebrow="Evaluation")
 
-        setup = _section(self.body, "Select files",
-                         "Use files from several size tiers. Multithreading starts at %d MiB, so smaller "
-                         "files show its 'off' behaviour by design." % (SMALL_FILE_LIMIT // MIB), step=1)
+        # 1. files
+        setup = _section(self.body, "Choose the evidence files",
+                         "Use a mixed set, like the files of a disk image: many small files (batching "
+                         "applies below 32 MiB) and some large ones (threading applies from 32 MiB).", step=1)
         buttons = frame(setup)
         buttons.pack(fill="x", pady=(0, 10))
         FlatButton(buttons, "Add files…", self._add_files, kind="primary").pack(side="left", padx=(0, 6))
         FlatButton(buttons, "Add folder…", self._add_folder).pack(side="left", padx=(0, 6))
         FlatButton(buttons, "Remove selected", self._remove, kind="ghost", size="sm").pack(side="left", padx=6)
         FlatButton(buttons, "Clear", self._clear, kind="ghost", size="sm").pack(side="left")
+        self._file_summary = tk.StringVar(value="No files yet.")
+        tk.Label(setup, textvariable=self._file_summary, bg=P["surface"], fg=P["text_soft"],
+                 font=F["body"], anchor="w").pack(fill="x", pady=(0, 8))
         self._file_table = _table(setup, [
-            ("name", "File", 380, "w"), ("size", "Size", 110, "e"),
-            ("tier", "Size tier", 240, "w"), ("threads", "Multithreading applies", 180, "w"),
+            ("name", "File", 380, "w"), ("size", "Size", 100, "e"),
+            ("tier", "Size tier", 220, "w"), ("applies", "Technique that applies", 260, "w"),
         ], height=5)
 
-        run = _section(self.body, "Configure and run", step=2)
-        self._trials = _TrialControls(run)
-        self._trials.pack(fill="x")
-        options = frame(run)
-        options.pack(fill="x", pady=(14, 0))
-        self._refs = tk.BooleanVar(value=True)
-        check(options, "Include SHA-256 / SHA-1 / MD5 reference algorithms", self._refs).pack(anchor="w")
+        # 2. configurations
+        configs = _section(self.body, "Choose the configurations",
+                           "C0 is always included because every result is compared with it.", step=2)
+        self._config_vars: Dict[str, tk.BooleanVar] = {}
+        for configuration in TABLE8_CONFIGURATIONS:
+            code = configuration["code"]
+            var = tk.BooleanVar(value=True)
+            self._config_vars[code] = var
+            row = frame(configs)
+            row.pack(fill="x", pady=2)
+            box = check(row, configuration["label"], var)
+            box.configure(width=34, anchor="w")
+            if code == "C0":
+                box.configure(state="disabled")
+            box.pack(side="left")
+            _cap(row, _CONFIGURATION_HELP[code]).pack(side="left", padx=(4, 0))
+
+        # 3. run
+        run = _section(self.body, "Run", step=3)
+        chips = frame(run)
+        chips.pack(fill="x")
+        self._chips: List[FlatButton] = []
+        self.trials = tk.IntVar(value=30)
+        for index, (name, trials) in enumerate(self.PRESETS):
+            chip = FlatButton(chips, "%s · %d trials" % (name, trials), lambda i=index: self._preset(i),
+                              kind="chip_off")
+            chip.pack(side="left", padx=(0, 8))
+            self._chips.append(chip)
+        _cap(chips, "Trials").pack(side="left", padx=(12, 0))
+        spinbox(chips, self.trials, from_=3, to=200, increment=1, width=5).pack(side="left", padx=6, ipady=3)
+        _cap(run, "Each trial runs every chosen configuration once, in a rotated order, after one untimed "
+                  "warm-up that loads the files into memory.", wraplength=980,
+             justify="left").pack(fill="x", pady=(8, 0))
+        self._preset(1)
         action = frame(run)
-        action.pack(fill="x", pady=(16, 0))
-        self._run_btn = FlatButton(action, "Run experiment", self._start, kind="primary", size="lg")
+        action.pack(fill="x", pady=(14, 0))
+        self._run_btn = FlatButton(action, "Run evaluation", self._start, kind="primary", size="lg")
         self._run_btn.pack(side="left")
         self._progress = ProgressPanel(action)
         self._progress.pack(side="left", fill="x", expand=True, padx=18)
 
+        # results
         head = frame(self.body, bg="bg")
         head.pack(fill="x", padx=24, pady=(8, 10))
         label(head, "Results", bg="bg", font="h2").pack(side="left")
         FlatButton(head, "Open results folder", lambda: open_folder(RESULTS_DIR), kind="ghost",
                    size="sm").pack(side="right")
-        self._chooser = ttk.Combobox(head, width=56, state="readonly")
-        self._chooser.pack(side="right", padx=8)
-        self._chooser.bind("<<ComboboxSelected>>", lambda _e: self._show_file())
-        _cap(head, "File", bg="bg").pack(side="right")
         self._banner = Banner(self.body, bg="bg")
         self._banner.pack(fill="x", padx=24, pady=(0, 10))
-        self._tiles = tile_row(self.body, ["C4 vs C0", "C1 buffer sizing only",
-                                           "C3 threading only", "Parallel portion P (Eq. 17)"])
-
-        chart = _section(self.body, "Speedup over Baseline BLAKE3",
-                         "Bars show the mean speedup (Eq. 3); whiskers show the range implied by the 95 % "
-                         "confidence interval of the mean paired difference.")
+        self._tiles = tile_row(self.body, ["C1 buffer only", "C2 batching only", "C3 threading only",
+                                           "C4 all together"])
+        chart = _section(self.body, "Speedup over C0 Baseline BLAKE3",
+                         "Above 1.00× = faster than the baseline. Whiskers: range implied by the 95 % "
+                         "confidence interval of the paired difference.")
         self._chart = SpeedupChart(chart)
         self._chart.pack(fill="x")
-
-        details = _section(self.body, "Detailed statistics",
-                           "BLAKE3 rows: Speedup = Baseline time ÷ configuration time. Reference rows (grey): "
-                           "Speedup = that algorithm's time ÷ Optimized BLAKE3 time, using the same 1 MiB "
-                           "single-thread reads. Peak memory of memory-mapped configurations includes the "
-                           "mapped file's pages: shared operating-system file cache that can be reclaimed, "
-                           "not memory the program allocated.")
-        self._table = _table(details, _RESULT_COLUMNS, height=8)
+        details = _section(self.body, "Detailed statistics")
+        self._table = _table(details, _RESULT_COLUMNS, height=7)
         tk.Label(details, text=_GLOSSARY, bg=P["surface"], fg=P["muted"], font=F["small"], anchor="w",
                  justify="left", wraplength=980).pack(fill="x", pady=(10, 0))
-
-        tiers = _section(self.body, "By size tier", "Geometric-mean speedup across all files in each tier.")
-        self._tier_table = _table(tiers, [
-            ("tier", "Size tier", 260, "w"), ("config", "Configuration", 240, "w"),
-            ("files", "Files", 60, "e"), ("gm", "Speedup", 120, "e"),
-            ("faster", "Significantly faster", 150, "e"), ("slower", "Significantly slower", 150, "e"),
-        ], height=5)
+        tiers = _section(self.body, "Speed by file size",
+                         "Mean hashing speed (MiB/s) inside the engine for each size tier — how speed "
+                         "changes as files get larger.")
+        self._tier_frame = frame(tiers)
+        self._tier_frame.pack(fill="x")
+        self._tier_table: Optional[ttk.Treeview] = None
         self._notes = tk.StringVar(value="")
         tk.Label(tiers, textvariable=self._notes, bg=P["surface"], fg=P["muted"], font=F["small"],
                  anchor="w", justify="left", wraplength=980).pack(fill="x", pady=(10, 0))
         self.finish_page()
 
+    # file list
+    def _preset(self, index: int):
+        self.trials.set(self.PRESETS[index][1])
+        for i, chip in enumerate(self._chips):
+            chip.set_kind("chip_on" if i == index else "chip_off")
+
     def _refresh_files(self):
         self._file_table.delete(*self._file_table.get_children())
-        for path in self._files:
+        sizes = []
+        for path in self._files[:2000]:
             size = os.path.getsize(path)
+            sizes.append(size)
             tree_insert(self._file_table, (os.path.basename(path), format_size(size), size_tier(size),
-                                           "✔ yes" if size >= SMALL_FILE_LIMIT else "no (below threshold)"),
+                                           "multithreading" if size >= SMALL_FILE_LIMIT else "batching"),
                         iid=path)
+        sizes = [os.path.getsize(p) for p in self._files]
+        small = sum(1 for s in sizes if s < SMALL_FILE_LIMIT)
+        self._file_summary.set(
+            "No files yet." if not sizes else
+            "%d files · %s · %d below 32 MiB (batching applies) · %d of 32 MiB or more (threading applies)"
+            % (len(sizes), format_size(sum(sizes)), small, len(sizes) - small))
 
     def _add(self, paths):
+        known = set(self._files)
         for path in paths:
             path = str(Path(path).resolve())
-            if os.path.isfile(path) and path not in self._files:
+            if os.path.isfile(path) and path not in known:
                 self._files.append(path)
+                known.add(path)
         self._files.sort(key=os.path.getsize)
         self._refresh_files()
 
     def _add_files(self):
-        self._add(filedialog.askopenfilenames(title="Select benchmark files"))
+        self._add(filedialog.askopenfilenames(title="Select evidence files"))
 
     def _add_folder(self):
-        folder = filedialog.askdirectory(title="Select a folder (files in it are added, not subfolders)")
+        folder = filedialog.askdirectory(title="Select a folder (subfolders are included)")
         if folder:
-            self._add([str(p) for p in Path(folder).iterdir() if p.is_file()])
+            self._add([str(p) for p in Path(folder).rglob("*") if p.is_file()])
 
     def _remove(self):
         for iid in self._file_table.selection():
@@ -1638,289 +1409,104 @@ class TechniqueBenchmarkTab(_Tab):
         self._files.clear()
         self._refresh_files()
 
+    # run
     def _start(self):
         if self.guard_busy():
             return
         if not self._files:
-            messagebox.showwarning("No files", "Add at least one file.")
+            messagebox.showwarning("No files", "Add evidence files first.")
             return
-        settings = self._trials.values()
-        if settings is None:
+        try:
+            trials = int(self.trials.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Invalid trials", "Trials must be a whole number.")
             return
-        trials, warmups = settings
-        files, refs = list(self._files), self._refs.get()
-        planned = planned_read_bytes([os.path.getsize(f) for f in files], trials, warmups, refs)
-        if planned > 200 * 1024 ** 3:
-            hours = planned / (2 * 1024 ** 3) / 3600
-            if not messagebox.askyesno(
-                    "Large evaluation",
-                    "This evaluation will read about %s in total (%d configurations × %d trials and "
-                    "warm-ups × %s of files).\n\nAt 2 GB/s that takes roughly %.1f hours; slower drives "
-                    "take longer. Continue?" % (
-                        format_size(planned), planned // max(1, sum(os.path.getsize(f) for f in files))
-                        // (trials + warmups), trials + warmups,
-                        format_size(sum(os.path.getsize(f) for f in files)), hours)):
-                return
+        codes = [code for code, var in self._config_vars.items() if var.get() or code == "C0"]
+        files = list(self._files)
+        planned = planned_read_bytes([os.path.getsize(f) for f in files], trials, 1, len(codes))
+        if planned > 200 * 1024 ** 3 and not messagebox.askyesno(
+                "Large evaluation", "This evaluation reads about %s in total. At 2 GB/s that takes about "
+                "%.1f hours. Continue?" % (format_size(planned), planned / (2 * 1024 ** 3) / 3600)):
+            return
         self.busy = True
         self._run_btn.configure(state="disabled")
 
         def work(progress, cancel):
-            report = run_large_file_ablation(files, trials=trials, warmups=warmups,
-                                             include_references=refs,
-                                             progress=progress, cancel=cancel)
-            report["exports"] = export_report(report, RESULTS_DIR, "large_file_ablation_" + timestamp())
+            report = run_configuration_trials(files, configurations=codes, trials=trials, warmups=1,
+                                              progress=progress, cancel=cancel)
+            report["exports"] = export_report(report, RESULTS_DIR, "technique_evaluation_" + timestamp())
             return report
 
         task = BackgroundTask(self, work, on_progress=self._progress.update_progress,
                               on_done=self._done, on_error=self._error, on_cancel=self._cancelled)
-        self._progress.start(task.cancel, "Self-test and first warm-up…")
+        self._progress.start(task.cancel, "Computing reference digests…")
         self.status("Technique evaluation running…")
 
     def _done(self, report):
         self.busy = False
         self._run_btn.configure(state="normal")
-        self._report = report
-        names = ["%s  (%s)" % (f["file"], format_size(f["size_bytes"])) for f in report["files"]]
-        self._chooser.configure(values=names)
-        self._chooser.current(len(names) - 1)
-        self._show_file()
-        self._tier_table.delete(*self._tier_table.get_children())
-        labels = {c["key"]: c["label"] for c in report["conditions"]}
-        for row in report["tier_summary"]:
-            tree_insert(self._tier_table, (row["size_tier"], labels.get(row["condition"], row["condition"]),
-                                           row["files"], fmt_speedup(row["geometric_mean_speedup"]),
-                                           row["significantly_faster"], row["significantly_slower"]))
-        exports = report["exports"]
-        self._notes.set("Saved: %s · %s · %s" % (exports["json"], exports["summary_csv"], exports["runs_csv"])
-                        + ("\nMeasurement notes: " + " ".join(report["warnings"]) if report["warnings"] else ""))
-        self._progress.finish("Complete. Every execution reproduced the expected digest.")
-        self.status("Technique evaluation complete")
-
-    def _show_file(self):
-        if not self._report:
-            return
-        report = self._report["files"][max(0, self._chooser.current())]
-        comparisons = {(c["family"], c["candidate"] if c["family"] == "technique" else c["reference"]): c
-                       for c in report["comparisons"]}
-        self._table.delete(*self._table.get_children())
-        chart_items = []
-        for key, item in report["conditions"].items():
-            reference = item["kind"] == "reference"
-            comparison = comparisons.get(("reference" if reference else "technique", key))
-            name = item["label"]
-            if not reference:
-                source = ("whole file · mmap" if "mmap" in item.get("io_strategy", "")
-                          and "unavailable" not in item.get("io_strategy", "")
-                          else format_size(item["buffer_bytes"]))
-                name += "  [%s · %d thr]" % (source, item["threads"])
-            tags = ("base",) if key == "baseline" else (
-                ("ref",) if reference else (_VERDICT_TAG.get(comparison["verdict"], "neutral"),))
-            tree_insert(self._table, _comparison_row_values(name, item, comparison, reference=reference), tags)
-            if comparison and not reference:
-                chart_items.append((item["label"], comparison["speedup"], comparison["speedup_ci95"],
-                                    _tone_for(comparison)))
-        self._chart.set_data(chart_items, report["file"])
-        optimized = comparisons.get(("technique", "optimized"))
-        if optimized:
-            tone = _tone_for(optimized)
-            self._tiles[0].set(fmt_speedup(optimized["speedup"]),
-                               verdict_text(optimized["verdict"]) + " · CI " + fmt_ci(optimized["speedup_ci95"]),
-                               tone if tone != "neutral" else None)
-            phrase = {"success": "faster than", "danger": "slower than"}.get(tone, "not clearly different from")
-            self._banner.show(
-                "%s (%s, %s): Optimized BLAKE3 was %s Baseline BLAKE3 — %s, 95 %% CI %s, Holm-adjusted p %s."
-                % (report["file"], format_size(report["size_bytes"]), report["size_tier"], phrase,
-                   fmt_speedup(optimized["speedup"]), fmt_ci(optimized["speedup_ci95"]),
-                   fmt_p(optimized.get("p_holm"))),
-                {"success": "success", "danger": "danger"}.get(tone, "info"))
-        for tile, key in ((self._tiles[1], "buffer_only"), (self._tiles[2], "threads_only")):
-            comparison = comparisons.get(("technique", key))
-            if comparison:
-                tile.set(fmt_speedup(comparison["speedup"]), verdict_text(comparison["verdict"]))
-        amdahl = report.get("amdahl", {}).get("optimized")
-        if amdahl and amdahl.get("parallel_fraction") is not None:
-            self._tiles[3].set("%.2f" % amdahl["parallel_fraction"],
-                               "implied by C4 on %d threads" % amdahl["threads"])
-        else:
-            self._tiles[3].set("—", "file below the 32 MiB threading threshold")
-        if report["warnings"]:
-            self._notes.set(self._notes.get().split("\nFile notes:")[0] + "\nFile notes: " + " ".join(report["warnings"]))
-
-    def _cancelled(self):
-        self.busy = False
-        self._run_btn.configure(state="normal")
-        self._progress.finish("Cancelled; no partial results were saved.")
-        self.status("Technique evaluation cancelled")
-
-    def _error(self, message, trace):
-        self.busy = False
-        self._run_btn.configure(state="normal")
-        self._progress.finish("Failed: " + message)
-        self.report_error(message, trace)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Batch Processing Evaluation (small files)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class SmallFileTab(_Tab):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-        self._paths: List[str] = []
-        _heading(self.body, "Batch Processing Evaluation",
-                 "Many small files, 2×2 experiment: batching (on/off) × parallel worker processes (on/off). "
-                 "One round hashes the whole set; the baseline is sequential, one file at a time.",
-                 eyebrow="Evaluation")
-        setup = _section(self.body, "Select the small-file set",
-                         "Every file below %d MiB in the folder and its subfolders is included. A set of at least 500 "
-                         "files is recommended; one can be generated on the Test Dataset page." % (SMALL_FILE_LIMIT // MIB), step=1)
-        row = frame(setup)
-        row.pack(fill="x")
-        self._folder = tk.StringVar()
-        entry(row, self._folder).pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
-        FlatButton(row, "Choose folder…", self._choose, kind="primary").pack(side="left")
-        self._set_info = tk.StringVar(value="No folder selected.")
-        tk.Label(setup, textvariable=self._set_info, bg=P["surface"], fg=P["muted"], font=F["body"],
-                 anchor="w").pack(fill="x", pady=(8, 0))
-
-        run = _section(self.body, "Configure and run", step=2)
-        self._trials = _TrialControls(run)
-        self._trials.pack(fill="x")
-        more = frame(run)
-        more.pack(fill="x", pady=(14, 0))
-        _cap(more, "Worker processes").pack(side="left")
-        self._workers = tk.IntVar(value=physical_cpu_count())
-        spinbox(more, self._workers, from_=2, to=max(2, logical_cpu_count()), width=4).pack(
-            side="left", padx=(6, 18), ipady=3)
-        _cap(more, "Files per batch").pack(side="left")
-        self._batch = tk.IntVar(value=DEFAULT_BATCH_SIZE)
-        spinbox(more, self._batch, from_=2, to=1024, width=6).pack(side="left", padx=6, ipady=3)
-        action = frame(run)
-        action.pack(fill="x", pady=(16, 0))
-        self._run_btn = FlatButton(action, "Run experiment", self._start, kind="primary", size="lg")
-        self._run_btn.pack(side="left")
-        self._progress = ProgressPanel(action)
-        self._progress.pack(side="left", fill="x", expand=True, padx=18)
-
-        head = frame(self.body, bg="bg")
-        head.pack(fill="x", padx=24, pady=(8, 10))
-        label(head, "Results", bg="bg", font="h2").pack(side="left")
-        FlatButton(head, "Open results folder", lambda: open_folder(RESULTS_DIR), kind="ghost",
-                   size="sm").pack(side="right")
-        self._banner = Banner(self.body, bg="bg")
-        self._banner.pack(fill="x", padx=24, pady=(0, 10))
-        self._tiles = tile_row(self.body, ["Parallel + batched vs sequential", "Batching only",
-                                           "Parallel workers only", "Test used (best)"])
-        chart = _section(self.body, "Speedup over sequential per-file hashing",
-                         "Bars show the mean speedup (Eq. 3); whiskers show the range implied by the 95 % "
-                         "confidence interval of the mean paired difference.")
-        self._chart = SpeedupChart(chart)
-        self._chart.pack(fill="x")
-        details = _section(self.body, "Detailed statistics")
-        columns = list(_RESULT_COLUMNS)
-        columns.insert(6, ("fps", "Files/s", 80, "e"))
-        self._table = _table(details, columns, height=5)
-        tk.Label(details, text=_GLOSSARY, bg=P["surface"], fg=P["muted"], font=F["small"], anchor="w",
-                 justify="left", wraplength=980).pack(fill="x", pady=(10, 0))
-        self._notes = tk.StringVar(value="")
-        tk.Label(details, textvariable=self._notes, bg=P["surface"], fg=P["muted"], font=F["small"],
-                 anchor="w", justify="left", wraplength=980).pack(fill="x", pady=(8, 0))
-        self.finish_page()
-
-    def load_folder(self, folder: str):
-        self._folder.set(folder)
-        files = [str(p) for p in sorted(Path(folder).rglob("*")) if p.is_file()]
-        self._paths = [p for p in files if os.path.getsize(p) < SMALL_FILE_LIMIT]
-        total = sum(os.path.getsize(p) for p in self._paths)
-        self._set_info.set("%d small files (%s total) · %d larger files excluded"
-                           % (len(self._paths), format_size(total), len(files) - len(self._paths)))
-
-    def _choose(self):
-        folder = filedialog.askdirectory(title="Select the small-file folder")
-        if folder:
-            self.load_folder(folder)
-
-    def _start(self):
-        if self.guard_busy():
-            return
-        if len(self._paths) < 2:
-            messagebox.showwarning("No files", "Choose a folder containing at least two small files.")
-            return
-        settings = self._trials.values()
-        if settings is None:
-            return
-        trials, warmups = settings
-        try:
-            workers, batch = int(self._workers.get()), int(self._batch.get())
-        except (ValueError, tk.TclError):
-            messagebox.showerror("Invalid settings", "Workers and batch size must be whole numbers.")
-            return
-        paths = list(self._paths)
-        self.busy = True
-        self._run_btn.configure(state="disabled")
-
-        def work(progress, cancel):
-            report = run_small_file_ablation(paths, trials=trials, warmups=warmups, workers=workers,
-                                             batch_size=batch, progress=progress, cancel=cancel)
-            report["exports"] = export_report(report, RESULTS_DIR, "small_file_ablation_" + timestamp())
-            return report
-
-        task = BackgroundTask(self, work, on_progress=self._progress.update_progress,
-                              on_done=self._done, on_error=self._error, on_cancel=self._cancelled)
-        self._progress.start(task.cancel, "Computing reference digests and starting workers…")
-        self.status("Batch processing evaluation running…")
-
-    def _done(self, report):
-        self.busy = False
-        self._run_btn.configure(state="normal")
         comparisons = {c["candidate"]: c for c in report["comparisons"]}
+        references = {r["reference"]: r["speedup_vs_c0"] for r in report["references"]}
         self._table.delete(*self._table.get_children())
         chart_items = []
-        for key, item in report["summary"].items():
-            comparison = comparisons.get(key)
-            values = list(_comparison_row_values(item["label"], item, comparison))
-            values.insert(6, "%.0f" % item["files_per_second_mean"])
-            tags = ("base",) if comparison is None else (_VERDICT_TAG.get(comparison["verdict"], "neutral"),)
-            tree_insert(self._table, values, tags)
+        for code, item in report["summary"].items():
+            comparison = comparisons.get(code)
+            tags = ("base",) if code == "C0" else (("ref",) if code in references else (
+                _VERDICT_TAG.get(comparison["verdict"], "neutral"),))
+            tree_insert(self._table, _comparison_row_values(item["label"], item, comparison,
+                                                            reference_speedup=references.get(code)), tags)
             if comparison:
                 chart_items.append((item["label"], comparison["speedup"], comparison["speedup_ci95"],
                                     _tone_for(comparison)))
         workload = report["workload"]
         self._chart.set_data(chart_items, "%d files · %s" % (workload["files"],
                                                             format_size(workload["total_bytes"])))
-        best = comparisons.get("parallel_batched")
+        for tile, code in zip(self._tiles, ("C1", "C2", "C3", "C4")):
+            comparison = comparisons.get(code)
+            if comparison:
+                tone = _tone_for(comparison)
+                tile.set(fmt_speedup(comparison["speedup"]), verdict_text(comparison["verdict"]),
+                         tone if tone != "neutral" else None)
+            else:
+                tile.set("—", "not run")
+        best = comparisons.get("C4")
         if best:
             tone = _tone_for(best)
-            self._tiles[0].set(fmt_speedup(best["speedup"]),
-                               verdict_text(best["verdict"]) + " · CI " + fmt_ci(best["speedup_ci95"]),
-                               tone if tone != "neutral" else None)
+            phrase = {"success": "faster than", "danger": "slower than"}.get(tone, "not clearly different from")
             self._banner.show(
-                "Parallel + batched hashing was %s than sequential per-file hashing — %s, 95 %% CI %s, "
-                "Holm-adjusted p %s." % (
-                    {"success": "faster", "danger": "slower"}.get(tone, "not clearly different"),
-                    fmt_speedup(best["speedup"]), fmt_ci(best["speedup_ci95"]), fmt_p(best.get("p_holm"))),
+                "With all three techniques (C4) the files were hashed %s the baseline (C0): %s, "
+                "Holm-adjusted p %s (%s)." % (phrase, fmt_speedup(best["speedup"]), fmt_p(best.get("p_holm")),
+                                              best["test"]),
                 {"success": "success", "danger": "danger"}.get(tone, "info"))
-        for tile, key in ((self._tiles[1], "sequential_batched"), (self._tiles[2], "parallel")):
-            comparison = comparisons.get(key)
-            if comparison:
-                tile.set(fmt_speedup(comparison["speedup"]), verdict_text(comparison["verdict"]))
-        if best:
-            self._tiles[3].set(best["test"], "Shapiro–Wilk p = %s" % fmt_p(best.get("shapiro_p")))
+        self._show_tiers(report)
+        notes = []
+        for code, amdahl in report["amdahl"].items():
+            if amdahl.get("parallel_fraction") is not None:
+                notes.append("Amdahl's Law (Eq. 17): the %s speedup on %d threads implies a parallel portion "
+                             "P = %.2f." % (code, amdahl["threads"], amdahl["parallel_fraction"]))
         exports = report["exports"]
-        self._notes.set(
-            "Workload: %d files, %s, median %s per file · %d workers · %d files per batch · worker start-up "
-            "%.3f s (excluded from trials).\nSaved: %s · %s · %s\nMeasurement notes: %s" % (
-                workload["files"], format_size(workload["total_bytes"]),
-                format_size(workload["median_file_bytes"]), workload["workers"], workload["batch_size"],
-                workload["pool_startup_seconds"], exports["json"], exports["summary_csv"],
-                exports["runs_csv"], " ".join(report["warnings"])))
-        self._progress.finish("Complete. Every mode reproduced every file's digest.")
-        self.status("Batch processing evaluation complete")
+        notes.append("Saved: %s · %s · %s" % (exports["json"], exports["summary_csv"], exports["runs_csv"]))
+        if report["warnings"]:
+            notes.append("Notes: " + " ".join(report["warnings"]))
+        self._notes.set("\n".join(notes))
+        self._progress.finish("Complete. Every configuration reproduced every file's digest.")
+        self.status("Technique evaluation complete")
+
+    def _show_tiers(self, report):
+        for child in self._tier_frame.winfo_children():
+            child.destroy()
+        codes = [c["code"] for c in report["configurations"]]
+        self._tier_table = _table(self._tier_frame, [("tier", "Size tier", 230, "w")]
+                                  + [(code, code, 90, "e") for code in codes], height=4)
+        for row in report["size_tiers"]:
+            tree_insert(self._tier_table, [row["size_tier"]] + [fmt_num(row.get(code), "%.0f")
+                                                                 for code in codes])
 
     def _cancelled(self):
         self.busy = False
         self._run_btn.configure(state="normal")
         self._progress.finish("Cancelled; no partial results were saved.")
+        self.status("Technique evaluation cancelled")
 
     def _error(self, message, trace):
         self.busy = False
@@ -2104,200 +1690,6 @@ class VerificationTab(_Tab):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dataset
-# ─────────────────────────────────────────────────────────────────────────────
-
-class DatasetTab(_Tab):
-    _MAX_SIZES = {"64 MiB": 64 * MIB, "256 MiB": 256 * MIB, "1 GiB": 1024 * MIB}
-
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-        _heading(self.body, "Test Dataset",
-                 "Build and document the benchmark dataset. The manifest records every file's format, size "
-                 "tier, source and SHA-256, shows what is covered and what is missing, and lets others "
-                 "reproduce the dataset.", eyebrow="Validation")
-        gen = _section(self.body, "Generate controlled test files",
-                       "Synthetic files are suitable for size sweeps because BLAKE3's cost depends on how many "
-                       "bytes there are, not their values. Real files of each format are still needed to show "
-                       "the dataset is representative.", step=1)
-        row = frame(gen)
-        row.pack(fill="x")
-        _cap(row, "Output folder").pack(side="left", padx=(0, 8))
-        self._out = tk.StringVar(value=str(_ROOT / "digital_evidence_dataset" / "generated"))
-        entry(row, self._out).pack(side="left", fill="x", expand=True, ipady=5)
-        FlatButton(row, "Browse…", lambda: self._pick(self._out)).pack(side="left", padx=(8, 0))
-        row2 = frame(gen)
-        row2.pack(fill="x", pady=(12, 0))
-        _cap(row2, "Size sweep up to").pack(side="left")
-        self._max = tk.StringVar(value="1 GiB")
-        ttk.Combobox(row2, textvariable=self._max, values=list(self._MAX_SIZES), width=9,
-                     state="readonly").pack(side="left", padx=(6, 8))
-        self._gen_sweep = FlatButton(row2, "Generate size sweep", self._sweep, kind="primary")
-        self._gen_sweep.pack(side="left", padx=(0, 28))
-        _cap(row2, "Small files").pack(side="left")
-        self._count = tk.IntVar(value=2000)
-        spinbox(row2, self._count, from_=100, to=100000, increment=500, width=7).pack(
-            side="left", padx=(6, 8), ipady=3)
-        self._gen_small = FlatButton(row2, "Generate small-file set", self._small, kind="primary")
-        self._gen_small.pack(side="left")
-        self._gen_progress = ProgressPanel(gen)
-        self._gen_progress.pack(fill="x", pady=(14, 0))
-
-        cat = _section(self.body, "Catalogue a dataset folder",
-                       "Optionally put a sources.json in the folder mapping paths to their origin, e.g. "
-                       '{"disk_images/case1.E01": {"source": "Digital Corpora", "license": "public"}}. '
-                       "An E01 container is hashed as a stored file, so its hash is not the acquisition hash "
-                       "recorded inside it.", step=2)
-        row3 = frame(cat)
-        row3.pack(fill="x")
-        self._dataset_root = tk.StringVar(value=str(_ROOT / "digital_evidence_dataset"))
-        entry(row3, self._dataset_root).pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 8))
-        FlatButton(row3, "Browse…", lambda: self._pick(self._dataset_root)).pack(side="left", padx=(0, 8))
-        self._cat_btn = FlatButton(row3, "Build manifest", self._catalogue, kind="primary")
-        self._cat_btn.pack(side="left", padx=(0, 8))
-        FlatButton(row3, "Verify a manifest…", self._verify, kind="ghost").pack(side="left")
-        self._cat_progress = ProgressPanel(cat)
-        self._cat_progress.pack(fill="x", pady=(14, 0))
-
-        self._tiles = tile_row(self.body, ["Files", "Total size", "Categories covered", "Coverage gaps"])
-        self._gap_banner = Banner(self.body, bg="bg")
-        self._gap_banner.pack(fill="x", padx=24, pady=(0, 10))
-        matrix = _section(self.body, "Coverage matrix", "Files per category and size tier. Empty rows "
-                                                        "(red) are categories with no files yet.")
-        tiers = [label_ for label_, _lo, _hi in SIZE_TIERS]
-        self._matrix = _table(matrix, [("category", "Category", 190, "w")]
-                              + [("t%d" % i, t.split(" (")[0], 110, "center") for i, t in enumerate(tiers)]
-                              + [("total", "Total", 70, "e")], height=11)
-        _cap(matrix, "Tiers: " + " · ".join(tiers), wraplength=980, justify="left").pack(fill="x", pady=(8, 0))
-        self._summary = tk.StringVar(value="")
-        tk.Label(matrix, textvariable=self._summary, bg=P["surface"], fg=P["muted"], font=F["small"],
-                 anchor="w", justify="left", wraplength=980).pack(fill="x", pady=(6, 0))
-        self.finish_page()
-
-    def _pick(self, var: tk.StringVar):
-        folder = filedialog.askdirectory(title="Select folder")
-        if folder:
-            var.set(folder)
-
-    def _set_gen_state(self, state):
-        self._gen_sweep.configure(state=state)
-        self._gen_small.configure(state=state)
-
-    def _run_generation(self, fn, done_text):
-        if self.guard_busy():
-            return
-        self.busy = True
-        self._set_gen_state("disabled")
-
-        def done(paths):
-            self.busy = False
-            self._set_gen_state("normal")
-            self._gen_progress.finish("%s: %d files in %s" % (done_text, len(paths), paths[0].parent if paths else ""))
-
-        def error(message, trace):
-            self.busy = False
-            self._set_gen_state("normal")
-            self._gen_progress.finish("Failed: " + message)
-            self.report_error(message, trace)
-
-        BackgroundTask(self, fn, on_progress=self._gen_progress.update_progress, on_done=done, on_error=error)
-        self._gen_progress.start(None, "Writing files…")
-
-    def _sweep(self):
-        limit = self._MAX_SIZES[self._max.get()]
-        sizes = [s for s in DEFAULT_SWEEP_SIZES if s <= limit]
-        folder = Path(self._out.get()) / "size_sweep"
-        self._run_generation(lambda progress, cancel: generate_size_sweep(folder, sizes, progress=progress),
-                             "Size sweep written")
-
-    def _small(self):
-        try:
-            count = int(self._count.get())
-        except (ValueError, tk.TclError):
-            messagebox.showerror("Invalid count", "Use a whole number.")
-            return
-        folder = Path(self._out.get()) / "small_files"
-        self._run_generation(
-            lambda progress, cancel: generate_small_file_corpus(folder, count=count, progress=progress),
-            "Small-file set written")
-
-    def _catalogue(self):
-        if self.guard_busy():
-            return
-        root = self._dataset_root.get().strip()
-        if not os.path.isdir(root):
-            messagebox.showwarning("Invalid folder", "Select an existing dataset folder.")
-            return
-        self.busy = True
-        self._cat_btn.configure(state="disabled")
-
-        def work(progress, cancel):
-            manifest = build_manifest(root, progress=progress)
-            manifest["written"] = [str(p) for p in write_manifest(manifest, root)]
-            return manifest
-
-        BackgroundTask(self, work, on_progress=self._cat_progress.update_progress,
-                       on_done=self._catalogued, on_error=self._cat_error)
-        self._cat_progress.start(None, "Hashing and classifying files…")
-
-    def _catalogued(self, manifest):
-        self.busy = False
-        self._cat_btn.configure(state="normal")
-        self._matrix.delete(*self._matrix.get_children())
-        tiers = [label_ for label_, _lo, _hi in SIZE_TIERS]
-        covered = 0
-        for category, counts in manifest["coverage_matrix"].items():
-            total = sum(counts.values())
-            covered += bool(total)
-            tree_insert(self._matrix, [category] + [counts[t] or "·" for t in tiers] + [total],
-                        () if total else ("fail",))
-        gaps = manifest["gaps"]
-        self._tiles[0].set(str(manifest["file_count"]), "catalogued")
-        self._tiles[1].set(format_size(manifest["total_bytes"]))
-        self._tiles[2].set("%d / %d" % (covered, len(manifest["coverage_matrix"])), "categories with files")
-        self._tiles[3].set(str(len(gaps)), "to close before final runs" if gaps else "none",
-                           "danger" if gaps else "success")
-        if gaps:
-            self._gap_banner.show("Coverage gaps:\n• " + "\n• ".join(gaps), "warning")
-        else:
-            self._gap_banner.show("No coverage gaps detected.", "success")
-        self._summary.set("Manifest written to %s" % manifest["written"][0])
-        self._cat_progress.finish("Manifest complete")
-
-    def _cat_error(self, message, trace):
-        self.busy = False
-        self._cat_btn.configure(state="normal")
-        self._cat_progress.finish("Failed: " + message)
-        self.report_error(message, trace)
-
-    def _verify(self):
-        if self.guard_busy():
-            return
-        path = filedialog.askopenfilename(title="Select dataset_manifest.json",
-                                          filetypes=[("Manifest", "dataset_manifest.json"), ("JSON", "*.json")])
-        if not path:
-            return
-        self.busy = True
-
-        def done(report):
-            self.busy = False
-            message = "Manifest check %s: %d files, %d changed, %d missing." % (
-                "passed" if report["passed"] else "FAILED", report["checked"],
-                len(report["changed"]), len(report["missing"]))
-            self._cat_progress.finish(message)
-            self._gap_banner.show(message, "success" if report["passed"] else "danger")
-
-        def error(message, trace):
-            self.busy = False
-            self._cat_progress.finish("Failed: " + message)
-            self.report_error(message, trace)
-
-        BackgroundTask(self, lambda progress, cancel: verify_manifest(path),
-                       on_progress=self._cat_progress.update_progress, on_done=done, on_error=error)
-        self._cat_progress.start(None, "Re-hashing files listed in the manifest…")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Overview
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2305,34 +1697,24 @@ class OverviewTab(_Tab):
     def __init__(self, parent, app):
         super().__init__(parent, app)
         _heading(self.body, THESIS_TITLE,
-                 "The system optimizes the hashing pipeline around BLAKE3: input buffering, parallel "
-                 "execution and batch processing. The BLAKE3 algorithm itself is unmodified, and every "
-                 "digest is a standard BLAKE3-256 value.", eyebrow="System overview")
+                 "The study optimizes how files are fed to BLAKE3 — buffer sizing, batching and "
+                 "multithreading. The BLAKE3 algorithm is unchanged: every digest is a standard "
+                 "BLAKE3-256 value.", eyebrow="Overview")
 
-        actions = frame(self.body, bg="bg")
-        actions.pack(fill="x", padx=24, pady=(0, 18))
-        FlatButton(actions, "Start hashing", lambda: app.show("hash"), kind="primary", size="lg").pack(side="left")
-        FlatButton(actions, "Run verification", lambda: app.show("verify"), size="lg").pack(side="left", padx=10)
-
-        note = Banner(self.body, bg="bg")
-        note.pack(fill="x", padx=24, pady=(0, 16))
-        note.show("Performance evaluation, correctness verification and test-dataset tools are available "
-                  "in Evaluation mode (switch at the bottom of the sidebar).", "info")
-        label(self.body, "Optimization techniques", bg="bg", font="h2").pack(anchor="w", padx=24, pady=(0, 10))
+        label(self.body, "The three techniques", bg="bg", font="h2").pack(anchor="w", padx=24, pady=(0, 10))
         grid = frame(self.body, bg="bg")
         grid.pack(fill="x", padx=24, pady=(0, 16))
-        for index, (icon, name, detail, page, page_name) in enumerate((
+        for index, (icon, name, detail) in enumerate((
             ("▤", "Adaptive buffer sizing",
-             "The input buffer follows file size instead of a fixed 1 MiB (Table 7: 64 KiB below "
-             "512 KiB up to 16 MiB from 1 GiB). Large local files of %d MiB or more are memory-mapped "
-             "on SSD/NVMe storage." % (SMALL_FILE_LIMIT // MIB), "technique", "Technique Evaluation"),
-            ("⚡", "Multithreading for large files",
-             "Files of %d MiB or more use BLAKE3's own tree-parallel mode on the physical cores. Smaller "
-             "files stay single-threaded because starting threads costs more than it saves."
-             % (SMALL_FILE_LIMIT // MIB), "technique", "Technique Evaluation"),
+             "Reads each file with a buffer that fits its size (Table 7): 64 KiB for the smallest files up "
+             "to 16 MiB for files of 1 GiB and above, instead of a fixed 1 MiB."),
             ("▦", "Batching small files",
-             "Small files are grouped %d per worker task, so one dispatch and one reusable buffer serve "
-             "many files." % DEFAULT_BATCH_SIZE, "small", "Batch Processing"),
+             "Files below %d MiB are sent to the hashing engine up to %d per request, so one request "
+             "serves many files. Each file still gets its own digest." % (SMALL_FILE_LIMIT // MIB, BATCH_WINDOW)),
+            ("⚡", "Multithreading large files",
+             "Files of %d MiB and above use BLAKE3's own parallel mode on the %d physical CPU cores. "
+             "Smaller files stay single-threaded because starting threads costs more than it saves."
+             % (SMALL_FILE_LIMIT // MIB, physical_cpu_count())),
         )):
             grid.columnconfigure(index, weight=1, uniform="tech")
             cell = tk.Frame(grid, bg=P["surface"], highlightbackground=P["border"], highlightthickness=1)
@@ -2344,82 +1726,58 @@ class OverviewTab(_Tab):
             label(inner, name, font="h3").pack(anchor="w", pady=(10, 4))
             label(inner, detail, fg="muted", font="small", wraplength=290, justify="left",
                   anchor="w").pack(anchor="w", fill="x")
-            FlatButton(inner, "Open %s →" % page_name, lambda p=page: app.show(p), kind="ghost",
-                       size="sm").pack(anchor="w", pady=(10, 0))
 
-        machine = _section(self.body, "This computer",
-                           "The engine adapts to the hardware it runs on. These are the values detected now.")
-        info = system_summary()
-        drives = []
-        try:
-            import psutil
-            for part in psutil.disk_partitions(all=False):
-                try:
-                    kind = storage_profile(part.mountpoint)["kind"]
-                except Exception:
-                    kind = "unknown"
-                drives.append("%s %s" % (part.mountpoint.rstrip("\\"), {"ssd": "SSD/NVMe", "hdd": "HDD",
-                                                                        "network": "network"}.get(kind, kind)))
-        except Exception:
-            pass
-        for name, value in (
-            ("Processor", info["cpu_model"]),
-            ("Parallel threads", "%d physical cores used for large files (%d logical threads)" % (
-                info["physical_cores"], info["logical_threads"])),
-            ("Memory", "%s GB" % info["memory_gib"] if info["memory_gib"] else "unknown"),
-            ("SIMD", info["simd_tier"]),
-            ("Drives", " · ".join(drives) or "unknown"),
-            ("Large-file strategy", "SSD/NVMe: memory-mapped in %d MiB windows on the physical cores · "
-             "HDD or network: sequential background reads with the Table 7 buffer" % (256)),
-        ):
-            row = frame(machine)
-            row.pack(fill="x", pady=2)
-            label(row, name, fg="muted", font="small", width=18, anchor="w").pack(side="left")
-            label(row, value, fg="text_soft", anchor="w", wraplength=820, justify="left").pack(side="left")
+        configs = _section(self.body, "How each technique is measured (Table 8)",
+                           "Technique Evaluation runs these configurations on the same files and compares "
+                           "each with C0.")
+        table = _table(configs, [("code", "Configuration", 250, "w"), ("buffer", "Input buffer", 150, "w"),
+                                 ("batch", "Small-file batching", 160, "w"),
+                                 ("threads", "Native threads", 230, "w")], height=7)
+        for configuration in TABLE8_CONFIGURATIONS:
+            blake3_run = configuration["algorithm"] == "BLAKE3"
+            threaded = configuration["profile"] in ("blake3_threads_only", "blake3_optimized")
+            tree_insert(table, (
+                configuration["label"],
+                "adaptive (Table 7)" if configuration["adaptive_buffer"] else "fixed 1 MiB",
+                "files below 32 MiB" if configuration["batching"] else "no",
+                ("physical cores at 32 MiB and above" if threaded else "one") if blake3_run else "n/a"))
+        FlatButton(configs, "Open Technique Evaluation →", lambda: app.show("technique"), kind="ghost",
+                   size="sm").pack(anchor="w", pady=(10, 0))
 
-        constant = _section(self.body, "Controlled variables")
+        constant = _section(self.body, "Kept the same in every configuration")
         for line in (
-            "The BLAKE3 algorithm and its output: official test vectors and an independent reference "
-            "implementation confirm standard hashes (Correctness Verification).",
-            "Native SIMD dispatch (%s): identical in the baseline and every optimized configuration."
-            % detected_simd_tier(),
-            "Reference algorithms (SHA-256, SHA-1, MD5): use the same 1 MiB single-thread reads as Baseline "
-            "BLAKE3 and are measured as configured here, not at their best possible speed.",
+            "The BLAKE3 algorithm and its digests (checked on the Correctness Verification page).",
+            "Native SIMD (%s): chosen automatically by the BLAKE3 library in every configuration, so it is "
+            "not one of the studied techniques." % detected_simd_tier(),
+            "The computer, the files and the order rotation: only the configuration changes between runs.",
         ):
             row = frame(constant)
             row.pack(fill="x", pady=3)
             label(row, "✔", fg="success", font="h3").pack(side="left", anchor="n", padx=(0, 10))
             label(row, line, fg="text_soft", wraplength=930, justify="left", anchor="w").pack(side="left", fill="x")
 
-        arch = _section(self.body, "System architecture", "Four layers; each calls only the layer below it.")
-        for number, (tier, modules, role) in enumerate((
-            ("Presentation", "main_app.py", "Interface: input selection, progress, tables, charts, export."),
-            ("Experiment control", "benchmark_blake3.py · blake3_validation.py · dataset_tool.py",
-             "Experiments and statistics (thesis Equations 1–19), verification with an independent reference BLAKE3, dataset manifests."),
-            ("Measurement", "_MetricSampler · FORMULAS (benchmark_blake3.py)",
-             "Timing, CPU and memory sampling; Shapiro–Wilk, paired t / Wilcoxon, Holm, Cohen's d (Section 3.5)."),
-            ("Hashing engine", "optimized_blake3.py → blake3 native extension",
-             "Adaptive policy, configurations, batching, Hash Files logic and hash lists; standard BLAKE3 with native SIMD."),
-        ), 1):
-            row = frame(arch, bg="surface_alt")
-            row.pack(fill="x", pady=3)
-            tk.Label(row, text=str(number), bg=P["accent"], fg=P["on_accent"], font=F["h3"], width=3,
-                     pady=10).pack(side="left", fill="y")
-            label(row, tier, bg="surface_alt", font="h3", width=24, anchor="w").pack(side="left", padx=14)
-            column = frame(row, bg="surface_alt")
-            column.pack(side="left", fill="x", expand=True, pady=8)
-            label(column, modules, bg="surface_alt", font="mono", anchor="w").pack(anchor="w")
-            label(column, role, fg="muted", bg="surface_alt", font="small", anchor="w").pack(anchor="w")
+        machine = _section(self.body, "This computer")
+        info = system_summary()
+        for name, value in (
+            ("Processor", info["cpu_model"]),
+            ("CPU cores", "%d physical cores (used for large files) · %d logical threads" % (
+                info["physical_cores"], info["logical_threads"])),
+            ("Memory", "%s GB" % info["memory_gib"] if info["memory_gib"] else "unknown"),
+            ("SIMD", info["simd_tier"]),
+            ("BLAKE3 library", "blake3 %s (official package)" % info["blake3_package_version"]),
+        ):
+            row = frame(machine)
+            row.pack(fill="x", pady=2)
+            label(row, name, fg="muted", font="small", width=18, anchor="w").pack(side="left")
+            label(row, value, fg="text_soft", anchor="w", wraplength=820, justify="left").pack(side="left")
 
-        flow = _section(self.body, "Evaluation workflow")
+        flow = _section(self.body, "How to use this tool")
         for number, (text, page) in enumerate((
-            ("Hash evidence files and check them against an expected hash.", "hash"),
-            ("Prepare the test dataset and review its coverage.", "dataset"),
-            ("Run the correctness verification; all checks must pass before performance results are "
-             "interpreted.", "verify"),
-            ("Evaluate the large-file techniques (standard protocol: 30 trials).", "technique"),
-            ("Evaluate batch processing on the small-file set.", "small"),
-            ("Export the formulas and statistical analysis plan.", "method"),
+            ("Hash evidence files, save a hash list, or check files against one.", "hash"),
+            ("Run the correctness checks: the optimized engine must give standard BLAKE3 digests.", "verify"),
+            ("Run the technique evaluation on a mixed set of evidence files (30 trials for the thesis).",
+             "technique"),
+            ("See every formula and the statistical analysis plan, or export them.", "method"),
         ), 1):
             row = frame(flow)
             row.pack(fill="x", pady=4)
@@ -2495,19 +1853,14 @@ class MethodologyTab(_Tab):
 # Application shell: sidebar + pages + theme
 # ─────────────────────────────────────────────────────────────────────────────
 
-# (group, evaluation-only?, pages). Evaluation-only groups hold the performance
-# evaluation and validation tools and are shown only when Evaluation mode is on.
+# (group heading, pages)
 NAVIGATION = (
-    ("HASHING", False, (("hash", "#", "Hash Files", HashFilesTab),
-                     ("analysis", "◎", "File Analysis", FileAnalysisTab))),
-    ("EVALUATION", True, (("technique", "⚡", "Technique Evaluation", TechniqueBenchmarkTab),
-                           ("small", "▤", "Batch Processing", SmallFileTab))),
-    ("VALIDATION", True, (("verify", "✓", "Correctness Verification", VerificationTab),
-                          ("dataset", "▦", "Test Dataset", DatasetTab))),
-    ("SYSTEM", False, (("overview", "ⓘ", "System Overview", OverviewTab),
-                      ("method", "ƒ", "Methodology", MethodologyTab))),
+    ("HASHING", (("hash", "#", "Hash Files", HashFilesTab),)),
+    ("EVALUATION", (("technique", "⚡", "Technique Evaluation", TechniqueBenchmarkTab),
+                    ("verify", "✓", "Correctness Verification", VerificationTab))),
+    ("ABOUT", (("overview", "ⓘ", "Overview", OverviewTab),
+               ("method", "ƒ", "Methodology", MethodologyTab))),
 )
-RESEARCH_PAGES = {key for _group, research, items in NAVIGATION if research for key, *_rest in items}
 
 _REMAP_OPTIONS = (
     "background", "foreground", "activebackground", "activeforeground", "highlightbackground",
@@ -2555,7 +1908,6 @@ class Blake3App(tk.Tk):
         super().__init__()
         self.settings = load_settings()
         self.theme = self.settings.get("theme", "light") if self.settings.get("theme") in THEMES else "light"
-        self.research_mode = bool(self.settings.get("research_mode", False))
         self.worker_pool = None
         self._closing = False
         P.clear()
@@ -2584,7 +1936,7 @@ class Blake3App(tk.Tk):
         content.grid(row=0, column=0, sticky="nsew")
         content.rowconfigure(0, weight=1)
         content.columnconfigure(0, weight=1)
-        for _group, _research, items in NAVIGATION:
+        for _group, items in NAVIGATION:
             for key, _icon, title, cls in items:
                 page = cls(content, self)
                 page.grid(row=0, column=0, sticky="nsew")
@@ -2648,12 +2000,6 @@ class Blake3App(tk.Tk):
         self._render_nav()
         footer = tk.Frame(bar, bg=P["sidebar"])
         footer.pack(side="bottom", fill="x", padx=14, pady=16)
-        self._research_btn = tk.Label(footer, text="", font=F["small"], pady=7, cursor="hand2")
-        self._research_btn.pack(fill="x", pady=(0, 6))
-        self._research_btn.bind("<Button-1>", lambda _e: self.toggle_research())
-        self._research_btn.bind("<Enter>", lambda _e: self._research_btn.configure(bg=P["sidebar_active"]))
-        self._research_btn.bind("<Leave>", lambda _e: self._paint_research_btn())
-        self._paint_research_btn()
         self._theme_btn = tk.Label(footer, text="", bg=P["sidebar_hover"], fg=P["sidebar_text"],
                                    font=F["small"], pady=7, cursor="hand2")
         self._theme_btn.pack(fill="x")
@@ -2662,8 +2008,8 @@ class Blake3App(tk.Tk):
         self._theme_btn.bind("<Leave>", lambda _e: self._theme_btn.configure(bg=P["sidebar_hover"]))
         self._update_theme_label()
         info = system_summary()
-        tk.Label(footer, text="%s\n%d threads · %s GB RAM · %s\nblake3 %s" % (
-            short_cpu_name(info["cpu_model"]), info["logical_threads"],
+        tk.Label(footer, text="%s\n%d cores · %s GB RAM · %s\nblake3 %s" % (
+            short_cpu_name(info["cpu_model"]), info["physical_cores"],
             info["memory_gib"] if info["memory_gib"] else "?", info["simd_tier"].split(" capable")[0],
             info["blake3_package_version"]), bg=P["sidebar"], fg=P["sidebar_muted"],
             font=F["small"], justify="left", anchor="w", wraplength=200).pack(fill="x", pady=(10, 0))
@@ -2672,9 +2018,7 @@ class Blake3App(tk.Tk):
         for child in self._nav_frame.winfo_children():
             child.destroy()
         self._nav_items = {}
-        for group, research, items in NAVIGATION:
-            if research and not self.research_mode:
-                continue
+        for group, items in NAVIGATION:
             tk.Label(self._nav_frame, text=group,
                      bg=P["sidebar"], fg=P["sidebar_muted"], font=F["tiny"],
                      anchor="w").pack(fill="x", padx=22, pady=(14, 4))
@@ -2682,27 +2026,6 @@ class Blake3App(tk.Tk):
                 self._nav_item(self._nav_frame, key, icon, title)
         if self._current in self._nav_items:
             self._paint_nav(self._current)
-
-    def _paint_research_btn(self):
-        on = self.research_mode
-        self._research_btn.configure(
-            text="⚗   Evaluation mode: %s" % ("On" if on else "Off"),
-            bg=P["sidebar_active"] if on else P["sidebar_hover"],
-            fg=P["sidebar_accent"] if on else P["sidebar_text"])
-
-    def toggle_research(self, enabled: Optional[bool] = None) -> None:
-        self.research_mode = (not self.research_mode) if enabled is None else bool(enabled)
-        self.settings["research_mode"] = self.research_mode
-        save_settings(self.settings)
-        if not self.research_mode and self._current in RESEARCH_PAGES:
-            self._current = ""
-            self._render_nav()
-            self.show("hash")
-        else:
-            self._render_nav()
-        self._paint_research_btn()
-        self.status_var.set("Evaluation mode %s" % ("on: evaluation, verification and dataset pages "
-                                                    "are shown" if self.research_mode else "off"))
 
     def _nav_item(self, parent, key, icon, title):
         row = tk.Frame(parent, bg=P["sidebar"], cursor="hand2")
@@ -2740,8 +2063,6 @@ class Blake3App(tk.Tk):
             widget.configure(bg=background)
 
     def show(self, key: str) -> None:
-        if key in RESEARCH_PAGES and not self.research_mode:
-            self.toggle_research(True)  # links to research pages switch the mode on
         previous, self._current = self._current, key
         self.pages[key].tkraise()
         for item in {previous, key} - {""}:
@@ -2786,7 +2107,6 @@ class Blake3App(tk.Tk):
                 _CHARTS.remove(chart)
         for key in self._nav_items:
             self._paint_nav(key)
-        self._paint_research_btn()
         self._update_theme_label()
         self.settings["theme"] = new
         save_settings(self.settings)

@@ -1,33 +1,27 @@
 #!/usr/bin/env python3
-"""Controlled technique-isolation benchmarks with statistical analysis.
+"""Experiments and statistics of thesis Chapter 3 (Section 3.5).
 
-Two experiments:
+* ``run_configuration_trials`` – the Table 8 configurations (C0 baseline, C1
+  buffer sizing only, C2 batching only, C3 threading only, C4 full optimized,
+  R1 MD5, R2 SHA-256) on one set of evidence files, through the same engine
+  data stream as the Autopsy module, with rotated order per trial block.
+* ``analyze_autopsy_trials`` – the same analysis for the trials CSV written by
+  the Autopsy ingest module.
 
-* **Large-file experiment** – the single-file configurations of thesis Table 8:
-  C0 Baseline, C1 buffer sizing only, C3 threading only and C4 buffer + threads
-  (batching, C2, does not apply to one file).
-  SHA-256, SHA-1 and MD5 are measured with the Baseline I/O path as reference
-  algorithms "as configured".
-* **Small-file experiment** (supplementary, standalone app only) – batching and
-  parallel dispatch of many small files.
-
-Both use a randomized complete block design: each round runs every condition
-once in a seeded random order. Warm-ups are excluded. Every execution must
-reproduce the expected digest, otherwise the benchmark aborts. Statistics and
-formulas are defined in this module
-(``FORMULAS`` = thesis Equations 1–19, and ``STATISTICAL_PLAN``) so the documented methodology and the code
-cannot silently disagree.
+Every execution must reproduce the reference digest, otherwise the run aborts.
+``FORMULAS`` (thesis Equations 1–19) and ``STATISTICAL_PLAN`` are defined here
+so the documented methodology and the code cannot disagree.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import platform
-import random
 import statistics
 import sys
 import threading
@@ -39,25 +33,15 @@ import blake3 as _blake3
 
 from dataset_tool import classify_format, size_tier
 from optimized_blake3 import (
-    BLAKE3_CONFIGS,
-    DEFAULT_BATCH_SIZE,
     MIB,
     OperationCancelled,
-    PAPER_CODES,
-    REFERENCE_ALGORITHMS,
     SMALL_FILE_LIMIT,
-    SMALL_FILE_MODES,
-    _MetricSampler,
-    adaptive_chunk_size,
+    TABLE8_BY_CODE,
+    TABLE8_CONFIGURATIONS,
+    EngineSession,
     detected_simd_tier,
-    hash_file_config,
-    hash_file_reference,
-    hash_small_files,
     logical_cpu_count,
-    make_worker_pool,
     physical_cpu_count,
-    self_test,
-    storage_profile,
     system_summary,
 )
 
@@ -684,8 +668,7 @@ def chi_square_sf(statistic: float, degrees_of_freedom: int) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_TRIALS = 30
-DEFAULT_WARMUPS = 2
-MIN_TRIALS = 10
+DEFAULT_WARMUPS = 1
 CV_LIMIT_PERCENT = 10.0
 SHORT_MEASUREMENT_MS = 10.0
 
@@ -712,13 +695,6 @@ def host_information() -> Dict[str, Any]:
         "simd_note": "Native SIMD dispatch is identical in every BLAKE3 configuration "
                      "(held constant; not a studied technique).",
     }
-
-
-def planned_read_bytes(sizes: Sequence[int], trials: int, warmups: int,
-                       include_references: bool = True) -> int:
-    """Total bytes a large-file experiment will read (to warn before huge runs)."""
-    conditions = len(BLAKE3_CONFIGS) + (len(REFERENCE_ALGORITHMS) if include_references else 0)
-    return int(sum(sizes)) * conditions * (int(trials) + int(warmups))
 
 
 def _check_cancel(cancel: Optional[threading.Event]) -> None:
@@ -802,7 +778,7 @@ def _paired_times(runs: List[Dict[str, Any]], keys: Sequence[str]) -> Dict[str, 
     table: Dict[str, Dict[int, float]] = {key: {} for key in keys}
     for run in runs:
         if run["condition"] in table:
-            table[run["condition"]][run["round"]] = run["elapsed_ms"]
+            table[run["condition"]][run.get("trial_block", run.get("round"))] = run["elapsed_ms"]
     rounds = sorted(set.intersection(*(set(v) for v in table.values()))) if table else []
     return {key: [table[key][r] for r in rounds] for key in keys}
 
@@ -821,407 +797,249 @@ def _warnings_for(summary: Dict[str, Dict[str, Any]], labels: Dict[str, str]) ->
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Experiment 1: large files (adaptive buffering × multithreading)
+# Technique evaluation: the Table 8 configurations on a set of evidence files
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _large_conditions(include_references: bool, threads: Optional[int]):
-    conditions = []
-    for config in BLAKE3_CONFIGS:
-        conditions.append((config.key, config.label, "blake3",
-                           lambda p, c=config: hash_file_config(p, c, threads=threads)))
-    if include_references:
-        for algorithm, label in REFERENCE_ALGORITHMS:
-            conditions.append((algorithm, label, "reference",
-                               lambda p, a=algorithm: hash_file_reference(p, a)))
-    return conditions
+DEFAULT_CONFIGURATION_CODES = tuple(c["code"] for c in TABLE8_CONFIGURATIONS)
 
 
-def run_large_file_ablation(
+def _expected_digests(paths: Sequence[str]) -> Dict[str, List[str]]:
+    """Reference digests computed outside the timer with the plain libraries."""
+    expected: Dict[str, List[str]] = {"BLAKE3": [], "MD5": [], "SHA-256": []}
+    for path in paths:
+        hashers = {"BLAKE3": _blake3.blake3(), "MD5": hashlib.md5(), "SHA-256": hashlib.sha256()}
+        with open(path, "rb") as source:
+            for block in iter(lambda: source.read(8 * MIB), b""):
+                for hasher in hashers.values():
+                    hasher.update(block)
+        for name, hasher in hashers.items():
+            expected[name].append(hasher.hexdigest())
+    return expected
+
+
+def run_configuration_trials(
     paths: Sequence[os.PathLike[str] | str],
     *,
+    configurations: Sequence[str] = DEFAULT_CONFIGURATION_CODES,
     trials: int = DEFAULT_TRIALS,
-    warmups: int = DEFAULT_WARMUPS,
-    include_references: bool = True,
-    threads: Optional[int] = None,
-    seed: int = 0xC0DE,
+    warmups: int = 1,
     progress: ProgressCallback = None,
     cancel: Optional[threading.Event] = None,
+    engine_command: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    if trials < 1 or warmups < 0:
-        raise ValueError("trials must be ≥ 1 and warmups ≥ 0")
+    """Run each Table 8 configuration on the whole file set, ``trials`` times.
+
+    Every configuration sends the files through the same persistent engine data
+    stream the Autopsy module uses (EngineSession), so batching (C2, C4) has its
+    real meaning: fewer requests between the client and the engine. The order of
+    the configurations is rotated in each trial block so no configuration always
+    runs first (Section 3.5). One untimed warm-up block loads the files into the
+    file cache. Every digest must equal the reference digest, or the run aborts.
+
+    The execution time of a run is the wall time from the first request to the
+    last response for the whole file set (Eq. 2); throughput is Eq. 1; CPU is the
+    mean of every psutil sample of every request (Eq. 5); memory is the largest
+    engine RSS sample (Eq. 6).
+    """
     files = [str(Path(p).resolve()) for p in paths]
+    files = [p for p in dict.fromkeys(files) if os.path.isfile(p)]
     if not files:
         raise ValueError("select at least one file")
-    conditions = _large_conditions(include_references, threads)
-    labels = {key: label for key, label, _kind, _fn in conditions}
-    kinds = {key: kind for key, _label, kind, _fn in conditions}
-    tracker = _Progress(progress, len(files) * len(conditions) * (trials + warmups))
-    validation = self_test()
-    if not validation["passed"]:
-        raise RuntimeError("engine self-test failed: " + validation["message"])
+    if trials < 1 or warmups < 0:
+        raise ValueError("trials must be at least 1 and warm-ups at least 0")
+    codes = [code for code in DEFAULT_CONFIGURATION_CODES if code in set(configurations)]
+    if "C0" not in codes:
+        raise ValueError("C0 (baseline) is required: every configuration is compared with it")
+    chosen = [TABLE8_BY_CODE[code] for code in codes]
+    sizes = [os.path.getsize(p) for p in files]
+    total_bytes = sum(sizes)
+    snapshot = {p: os.stat(p).st_mtime_ns for p in files}
+    tracker = _Progress(progress, len(codes) * (trials + warmups) + 1)
+    expected = _expected_digests(files)
+    tracker.step("Computed reference digests for %d files (not timed)" % len(files))
 
-    all_runs: List[Dict[str, Any]] = []
-    file_reports: List[Dict[str, Any]] = []
-    for file_index, path in enumerate(files):
-        name = os.path.basename(path)
-        before = os.stat(path)
-        size = int(before.st_size)
-        expected: Dict[str, str] = {}
-        warmup_records: List[Dict[str, Any]] = []
-        file_runs: List[Dict[str, Any]] = []
-
-        def execute(key: str, fn, round_number: int, position: int, warmup: bool):
+    runs: List[Dict[str, Any]] = []
+    per_file: List[Dict[str, Any]] = []
+    with EngineSession(engine_command) as session:
+        def execute(configuration: Dict[str, Any], block: int, position: int, warmup: bool) -> None:
             _check_cancel(cancel)
-            result = fn(path)
-            if result.status != "ok":
-                raise RuntimeError("%s failed on %s: %s" % (labels[key], name, result.error))
-            # BLAKE3 configurations must all agree; each reference must be stable.
-            digest_group = "blake3" if kinds[key] == "blake3" else key
-            reference_digest = expected.setdefault(digest_group, result.digest)
-            if result.digest != reference_digest:
-                raise RuntimeError("digest mismatch: %s produced a different digest for %s; "
-                                   "results discarded" % (labels[key], name))
-            record = {
-                "file": name, "path": path, "size_bytes": size,
-                "category": classify_format(path), "size_tier": size_tier(size),
-                "round": round_number, "position": position, "warmup": warmup,
-                "condition": key, "label": labels[key], "kind": kinds[key],
-                "elapsed_ms": result.elapsed_ms,
-                "throughput_mib_s": result.throughput_mb_s,
-                "cpu_percent": result.cpu_utilization_percent,
-                "process_cpu_percent": result.process_cpu_percent,
-                "peak_rss_mib": result.peak_rss_mb,
-                "buffer_bytes": result.chunk_size,
-                "threads": result.threads_used,
-                "io_strategy": result.io_strategy,
-                "digest": result.digest,
-            }
-            tracker.step("%s · %s · %s %d" % (
-                name, labels[key], "warm-up" if warmup else "round", round_number))
-            return record
+            started = time.perf_counter_ns()
+            results = session.hash_set(files, configuration)
+            elapsed_s = max(1e-9, (time.perf_counter_ns() - started) / 1e9)
+            reference = expected[configuration["algorithm"]]
+            for path, result, digest in zip(files, results, reference):
+                if result.get("status") != "ok" or result.get("digest") != digest:
+                    raise RuntimeError("%s produced a wrong or missing digest for %s (%s); results "
+                                       "discarded" % (configuration["label"], os.path.basename(path),
+                                                      result.get("message") or result.get("digest")))
+            cpu_total = cpu_count = 0.0
+            for result in results:
+                if result.get("cpu_utilization_percent") is not None:
+                    samples = max(1, int(result.get("cpu_samples") or 1))
+                    cpu_total += float(result["cpu_utilization_percent"]) * samples
+                    cpu_count += samples
+            rss = [r["peak_rss_mb"] for r in results if r.get("peak_rss_mb") is not None]
+            tracker.step("%s · %s %d" % (configuration["label"], "warm-up" if warmup else "trial", block))
+            if warmup:
+                return
+            runs.append({
+                "trial_block": block, "position": position, "condition": configuration["code"],
+                "label": configuration["label"], "files": len(files), "total_bytes": total_bytes,
+                "elapsed_ms": round(elapsed_s * 1000.0, 3),
+                "throughput_mib_s": round(throughput_mib_s(total_bytes, elapsed_s), 3),
+                "cpu_percent": round(cpu_total / cpu_count, 3) if cpu_count else None,
+                "cpu_samples": int(cpu_count),
+                "peak_rss_mib": max(rss) if rss else None,
+                "requests": len(files) if not configuration["batching"] else None,
+            })
+            for path, size, result in zip(files, sizes, results):
+                per_file.append({"trial_block": block, "condition": configuration["code"],
+                                 "size_bytes": size, "size_tier": size_tier(size),
+                                 "engine_ms": result.get("elapsed_ms"),
+                                 "threads": result.get("threads_used"),
+                                 "buffer_bytes": result.get("chunk_size")})
 
-        for warmup_number in range(1, warmups + 1):
-            order = list(conditions)
-            random.Random(seed ^ (file_index << 16) ^ (0xAAAA + warmup_number)).shuffle(order)
-            for position, (key, _label, _kind, fn) in enumerate(order, 1):
-                warmup_records.append(execute(key, fn, warmup_number, position, True))
+        for block in range(1, warmups + 1):
+            for position, configuration in enumerate(chosen, 1):
+                execute(configuration, block, position, True)
+        for block in range(1, trials + 1):
+            shift = (block - 1) % len(chosen)
+            order = chosen[shift:] + chosen[:shift]  # rotated per trial block
+            for position, configuration in enumerate(order, 1):
+                execute(configuration, block, position, False)
 
-        for round_number in range(1, trials + 1):
-            order = list(conditions)
-            random.Random(seed ^ (file_index << 16) ^ round_number).shuffle(order)
-            for position, (key, _label, _kind, fn) in enumerate(order, 1):
-                file_runs.append(execute(key, fn, round_number, position, False))
+    for path, mtime in snapshot.items():
+        if os.stat(path).st_mtime_ns != mtime:
+            raise RuntimeError("file changed during the evaluation: %s" % path)
 
-        after = os.stat(path)
-        if int(after.st_size) != size or int(after.st_mtime_ns) != int(before.st_mtime_ns):
-            raise RuntimeError("file changed during benchmark: %s" % name)
-
-        keys = [key for key, *_ in conditions]
-        summary = {key: _summarize_condition([r for r in file_runs if r["condition"] == key])
-                   for key in keys}
-        for key in keys:
-            summary[key].update({"label": labels[key], "kind": kinds[key],
-                                 "paper_code": PAPER_CODES.get(key, {"md5": "R1", "sha256": "R2"}
-                                                               .get(key, ""))})
-            first = next((r for r in warmup_records if r["condition"] == key), None)
-            summary[key]["first_warmup_ms"] = first["elapsed_ms"] if first else None
-            sample = next(r for r in file_runs if r["condition"] == key)
-            summary[key].update({"buffer_bytes": sample["buffer_bytes"],
-                                 "threads": sample["threads"],
-                                 "io_strategy": sample["io_strategy"]})
-        paired = _paired_times(file_runs, keys)
-        pairs = [("technique", "baseline", c.key) for c in BLAKE3_CONFIGS[1:]]
-        if include_references:
-            pairs += [("reference", algorithm, "optimized") for algorithm, _ in REFERENCE_ALGORITHMS]
-        comparisons = _comparisons(paired, pairs, seed)
-        amdahl = _amdahl_interpretation(comparisons, summary)
-        warnings = _warnings_for(summary, labels)
-        if size < SMALL_FILE_LIMIT:
-            warnings.append("File is below the %s multithreading threshold, so 'Multithreading "
-                            "only' equals Baseline by design." % _mib(SMALL_FILE_LIMIT))
-        file_reports.append({
-            "file": name, "path": path, "size_bytes": size,
-            "category": classify_format(path), "size_tier": size_tier(size),
-            "adaptive_buffer_bytes": adaptive_chunk_size(size),
-            "storage": {k: v for k, v in storage_profile(path).items()
-                        if k in ("kind", "drive_type", "seek_penalty")},
-            "blake3_digest": expected.get("blake3", ""),
-            "conditions": summary, "comparisons": comparisons,
-            "amdahl": amdahl, "warnings": warnings,
-            "warmup_runs": warmup_records,
-        })
-        all_runs.extend(file_runs)
-
+    labels = {c["code"]: c["label"] for c in chosen}
+    summary = {code: _summarize_condition([r for r in runs if r["condition"] == code])
+               for code in codes}
+    for code in codes:
+        summary[code]["label"] = labels[code]
+        summary[code]["kind"] = "reference" if code.startswith("R") else "blake3"
+        summary[code]["configuration"] = TABLE8_BY_CODE[code]
+    paired = _paired_times(runs, codes)
+    technique = [code for code in ("C1", "C2", "C3", "C4") if code in codes]
+    comparisons = _comparisons(paired, [("technique", "C0", code) for code in technique], seed=0)
+    references = []
+    for code in (c for c in codes if c.startswith("R")):
+        base = summary["C0"]["elapsed_ms"]["mean"]
+        mean = summary[code]["elapsed_ms"]["mean"]
+        references.append({"reference": code, "speedup_vs_c0": speedup(base, mean),
+                           "note": "reference point; not tested (Section 1.5)"})
+    cores = physical_cpu_count()
+    has_large = any(size >= SMALL_FILE_LIMIT for size in sizes)
+    amdahl = {}
+    for comparison in comparisons:
+        if comparison["candidate"] in ("C3", "C4") and has_large:
+            amdahl[comparison["candidate"]] = {
+                "threads": cores, "observed_speedup": comparison["speedup"],
+                "parallel_fraction": amdahl_parallel_fraction(comparison["speedup"], cores)}
+    warnings = _warnings_for(summary, labels)
+    if trials < DEFAULT_TRIALS:
+        warnings.append("%d trials per configuration; the thesis protocol uses %d."
+                        % (trials, DEFAULT_TRIALS))
+    if not has_large:
+        warnings.append("No file is %s or larger, so multithreading (C3, C4) cannot apply."
+                        % _mib(SMALL_FILE_LIMIT))
+    if sum(1 for s in sizes if s < SMALL_FILE_LIMIT) < 2:
+        warnings.append("Fewer than two files below %s, so batching (C2, C4) has nothing to group."
+                        % _mib(SMALL_FILE_LIMIT))
     return {
-        "schema_version": 3,
-        "experiment": "large-file technique isolation (adaptive buffering × multithreading)",
+        "schema_version": 4,
+        "experiment": "Table 8 configurations on one evidence file set (Section 3.5)",
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "host": host_information(),
-        "self_test": validation,
-        "design": _design(trials, warmups, seed),
-        "conditions": [{"key": k, "label": l, "kind": kd} for k, l, kd, _ in conditions],
-        "files": file_reports,
-        "tier_summary": _tier_summary(file_reports),
-        "runs": all_runs,
-        "warnings": [w for report in file_reports for w in
-                     ("%s: %s" % (report["file"], text) for text in report["warnings"])]
-        + ([] if trials >= MIN_TRIALS else
-           ["Fewer than %d trials: treat results as preliminary." % MIN_TRIALS]),
+        "design": {
+            "trials_per_configuration": trials, "warmup_blocks": warmups,
+            "order": "rotated in each trial block", "pairing": "by trial block",
+            "timing_scope": "first request to last response for the whole file set, through the "
+                            "engine data stream (Eq. 2)",
+            "tests": "Shapiro-Wilk on paired differences, then paired t-test or Wilcoxon signed-rank; "
+                     "Holm over the comparisons with C0; d = mean(d)/s_d (Eq. 18)",
+            "simd": detected_simd_tier() + " — identical in every configuration (not a technique)",
+        },
+        "workload": {
+            "files": len(files), "total_bytes": total_bytes,
+            "small_files": sum(1 for s in sizes if s < SMALL_FILE_LIMIT),
+            "large_files": sum(1 for s in sizes if s >= SMALL_FILE_LIMIT),
+            "smallest_bytes": min(sizes), "largest_bytes": max(sizes),
+            "categories": sorted({classify_format(p) for p in files}),
+        },
+        "configurations": [TABLE8_BY_CODE[code] for code in codes],
+        "summary": summary,
+        "comparisons": comparisons,
+        "references": references,
+        "amdahl": amdahl,
+        "size_tiers": _size_tier_table(per_file, codes),
+        "warnings": warnings,
+        "runs": runs,
+        "file_paths": files,
     }
 
 
-def _amdahl_interpretation(comparisons: List[Dict[str, Any]],
-                           summary: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Eq. 17: parallel portion P implied by each multithreaded configuration's speedup."""
-    result: Dict[str, Any] = {}
-    for comparison in comparisons:
-        key = comparison["candidate"]
-        if comparison["family"] != "technique" or key not in summary:
-            continue
-        threads = int(summary[key].get("threads") or 1)
-        if threads > 1:
-            fraction = amdahl_parallel_fraction(comparison["speedup"], threads)
-            result[key] = {
-                "threads": threads,
-                "observed_speedup": comparison["speedup"],
-                "parallel_fraction": fraction,
-                "ideal_speedup_if_fully_parallel": float(threads),
-            }
-    return result
+def _size_tier_table(per_file: List[Dict[str, Any]], codes: Sequence[str]) -> List[Dict[str, Any]]:
+    """Mean engine throughput by size tier and configuration (execution time vs file size)."""
+    rows = []
+    for tier in sorted({record["size_tier"] for record in per_file}):
+        row: Dict[str, Any] = {"size_tier": tier}
+        for code in codes:
+            items = [r for r in per_file if r["size_tier"] == tier and r["condition"] == code
+                     and r["engine_ms"]]
+            if items:
+                mib = sum(r["size_bytes"] for r in items) / MIB
+                seconds = sum(float(r["engine_ms"]) for r in items) / 1000.0
+                row[code] = round(mib / seconds, 1) if seconds > 0 else None
+        rows.append(row)
+    return rows
+
+
+def planned_read_bytes(sizes: Sequence[int], trials: int, warmups: int,
+                       configurations: int = len(DEFAULT_CONFIGURATION_CODES)) -> int:
+    """Total bytes an evaluation reads (to warn before very large runs)."""
+    return int(sum(sizes)) * int(configurations) * (int(trials) + int(warmups))
 
 
 def _mib(value: int) -> str:
     return "%d MiB" % (value // MIB)
 
 
-def _design(trials: int, warmups: int, seed: int) -> Dict[str, Any]:
-    return {
-        "type": "randomized complete block design (round = block)",
-        "measured_trials_per_condition": trials,
-        "warmups_per_condition": warmups,
-        "order_seed": seed,
-        "cache_state": "warm (file pages cached by the OS after warm-ups); first warm-up "
-                       "timings are retained separately as first-access observations",
-        "timing_scope": "open + read + hash + digest finalization (Eq. 2)",
-        "primary_indicator": "execution time, mean with t-based 95 % CI (Eq. 2, 7-10)",
-        "tests": "Shapiro-Wilk on paired differences, then paired t-test (normal) or Wilcoxon "
-                 "signed-rank; Holm correction across the comparisons with C0; effect size "
-                 "d = mean(d) / s_d (Eq. 18)",
-        "alpha": 0.05,
-        "formulas": "see FORMULAS",
-    }
-
-
-def _geometric_mean(values: Sequence[float]) -> Optional[float]:
-    values = [v for v in values if v and v > 0]
-    if not values:
-        return None
-    return math.exp(sum(math.log(v) for v in values) / len(values))
-
-
-def _tier_summary(file_reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows = []
-    tiers = sorted({report["size_tier"] for report in file_reports})
-    for tier in tiers:
-        members = [r for r in file_reports if r["size_tier"] == tier]
-        for candidate in [c.key for c in BLAKE3_CONFIGS[1:]]:
-            items = [c for r in members for c in r["comparisons"]
-                     if c["family"] == "technique" and c["candidate"] == candidate]
-            if not items:
-                continue
-            rows.append({
-                "size_tier": tier,
-                "condition": candidate,
-                "files": len(items),
-                "geometric_mean_speedup": _geometric_mean([i["speedup"] for i in items]),
-                "mean_speedup": statistics.fmean([i["speedup"] for i in items if i["speedup"]])
-                if any(i["speedup"] for i in items) else None,
-                "significantly_faster": sum(1 for i in items if i["verdict"] == "significantly faster"),
-                "significantly_slower": sum(1 for i in items if i["verdict"] == "significantly slower"),
-            })
-    return rows
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Experiment 2: small files (parallel dispatch × batching)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_small_file_ablation(
-    paths: Sequence[os.PathLike[str] | str],
-    *,
-    trials: int = DEFAULT_TRIALS,
-    warmups: int = DEFAULT_WARMUPS,
-    workers: Optional[int] = None,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    seed: int = 0x5EED,
-    progress: ProgressCallback = None,
-    cancel: Optional[threading.Event] = None,
-) -> Dict[str, Any]:
-    candidates = [str(Path(p).resolve()) for p in paths]
-    files = [p for p in candidates if os.path.getsize(p) < SMALL_FILE_LIMIT]
-    excluded = len(candidates) - len(files)
-    if len(files) < 2:
-        raise ValueError("the small-file experiment needs at least two files below %s"
-                         % _mib(SMALL_FILE_LIMIT))
-    total_bytes = sum(os.path.getsize(p) for p in files)
-    snapshot = {p: os.stat(p).st_mtime_ns for p in files}
-    labels = {mode.key: mode.label for mode in SMALL_FILE_MODES}
-    tracker = _Progress(progress, len(SMALL_FILE_MODES) * (trials + warmups) + 2)
-
-    expected = hash_small_files(files, "sequential")  # outside timing
-    tracker.step("Computed reference digests for %d files" % len(files))
-    pool, pool_startup_s = make_worker_pool(workers)
-    worker_count = max(1, int(workers or physical_cpu_count()))
-    tracker.step("Started %d worker processes (%.3f s, reported separately)"
-                 % (worker_count, pool_startup_s))
-    runs: List[Dict[str, Any]] = []
-    warmup_records: List[Dict[str, Any]] = []
-    try:
-        def execute(mode, round_number, position, warmup):
-            _check_cancel(cancel)
-            sampler = _MetricSampler(True, include_children=mode.parallel)
-            with sampler:
-                results = hash_small_files(files, mode, pool=pool, batch_size=batch_size)
-                elapsed_s, cpu, process_cpu, rss = sampler.finish()
-            if results != expected:
-                raise RuntimeError("digest mismatch in mode %s; results discarded" % mode.label)
-            record = {
-                "round": round_number, "position": position, "warmup": warmup,
-                "condition": mode.key, "label": mode.label,
-                "files": len(files), "total_bytes": total_bytes,
-                "elapsed_ms": round(elapsed_s * 1000.0, 3),
-                "throughput_mib_s": round(throughput_mib_s(total_bytes, elapsed_s), 3),
-                "files_per_second": round(len(files) / elapsed_s, 3) if elapsed_s else 0.0,
-                "cpu_percent": round(cpu, 3) if cpu is not None else None,
-                "process_cpu_percent": round(process_cpu, 3) if process_cpu is not None else None,
-                "peak_rss_mib": rss,
-                "workers": worker_count if mode.parallel else 1,
-                "batch_size": batch_size if mode.batched else 1,
-            }
-            tracker.step("%s · %s %d" % (mode.label, "warm-up" if warmup else "round", round_number))
-            return record
-
-        for warmup_number in range(1, warmups + 1):
-            order = list(SMALL_FILE_MODES)
-            random.Random(seed ^ (0xAAAA + warmup_number)).shuffle(order)
-            for position, mode in enumerate(order, 1):
-                warmup_records.append(execute(mode, warmup_number, position, True))
-        for round_number in range(1, trials + 1):
-            order = list(SMALL_FILE_MODES)
-            random.Random(seed ^ round_number).shuffle(order)
-            for position, mode in enumerate(order, 1):
-                runs.append(execute(mode, round_number, position, False))
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
-
-    for path, mtime in snapshot.items():
-        if os.stat(path).st_mtime_ns != mtime:
-            raise RuntimeError("file changed during benchmark: %s" % path)
-
-    keys = [mode.key for mode in SMALL_FILE_MODES]
-    summary = {key: _summarize_condition([r for r in runs if r["condition"] == key]) for key in keys}
-    for key in keys:
-        files_per_second = [r["files_per_second"] for r in runs if r["condition"] == key]
-        summary[key].update({
-            "label": labels[key],
-            "files_per_second_mean": statistics.fmean(files_per_second),
-            "first_warmup_ms": next((r["elapsed_ms"] for r in warmup_records
-                                     if r["condition"] == key), None),
-        })
-    paired = _paired_times(runs, keys)
-    comparisons = _comparisons(paired, [("technique", "sequential", key) for key in keys[1:]], seed)
-    sizes = [os.path.getsize(p) for p in files]
-    return {
-        "schema_version": 3,
-        "experiment": "small-file technique isolation (batching × parallel dispatch)",
-        "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "host": host_information(),
-        "design": dict(_design(trials, warmups, seed),
-                       timing_scope="dispatch + open + read + hash + digest finalization for the "
-                                    "whole file set (Eq. 2); worker-pool start-up excluded and "
-                                    "reported separately",
-                       cpu_scope="process tree (parent + worker processes) for parallel modes"),
-        "workload": {
-            "files": len(files), "excluded_large_files": excluded,
-            "total_bytes": total_bytes, "median_file_bytes": statistics.median(sizes),
-            "min_file_bytes": min(sizes), "max_file_bytes": max(sizes),
-            "workers": worker_count, "batch_size": batch_size,
-            "pool_startup_seconds": round(pool_startup_s, 4),
-        },
-        "conditions": [{"key": m.key, "label": m.label, "parallel": m.parallel,
-                        "batched": m.batched} for m in SMALL_FILE_MODES],
-        "summary": summary,
-        "comparisons": comparisons,
-        "warnings": _warnings_for(summary, labels)
-        + ([] if trials >= MIN_TRIALS else
-           ["Fewer than %d trials: treat results as preliminary." % MIN_TRIALS])
-        + (["Peak memory of parallel modes includes idle worker processes; compare memory "
-            "within the same dispatch level."]),
-        "warmup_runs": warmup_records,
-        "runs": runs,
-    }
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Export
 # ─────────────────────────────────────────────────────────────────────────────
 
-def write_runs_csv(path: os.PathLike[str] | str, runs: List[Dict[str, Any]]) -> None:
-    if not runs:
-        return
-    columns = list(runs[0].keys())
-    with open(path, "w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(runs)
-
-
 def summary_rows(report: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Flat per-condition rows (one per file × condition) for spreadsheets."""
-    groups = report["files"] if "files" in report else [dict(
-        file="small-file workload (%d files)" % report["workload"]["files"],
-        size_bytes=report["workload"]["total_bytes"], size_tier="", category="",
-        conditions=report["summary"], comparisons=report["comparisons"])]
+    """One row per configuration, for spreadsheets."""
+    comparisons = {c["candidate"]: c for c in report["comparisons"]}
+    references = {r["reference"]: r for r in report.get("references", [])}
     rows = []
-    for group in groups:
-        comparisons = {c["candidate"]: c for c in group["comparisons"] if c["family"] == "technique"}
-        references = {c["reference"]: c for c in group["comparisons"] if c["family"] == "reference"}
-        for key, item in group["conditions"].items():
-            comparison = comparisons.get(key) or references.get(key) or {}
-            ci = item["elapsed_ms"]["ci95"] or [None, None]
-            speedup_ci = comparison.get("speedup_ci95") or [None, None]
-            rows.append({
-                "file": group["file"], "size_bytes": group["size_bytes"],
-                "size_tier": group["size_tier"], "category": group["category"],
-                "condition": key, "paper_code": item.get("paper_code", ""), "label": item["label"],
-                "n": item["elapsed_ms"]["n"],
-                "mean_ms": item["elapsed_ms"]["mean"], "stdev_ms": item["elapsed_ms"]["stdev"],
-                "mean_ci95_low_ms": ci[0], "mean_ci95_high_ms": ci[1],
-                "cv_percent": item["elapsed_ms"]["cv_percent"],
-                "mean_throughput_mib_s": item["throughput_mib_s"]["mean"],
-                "mean_cpu_percent": item["cpu_percent"]["mean"],
-                "mean_peak_rss_mib": item["peak_rss_mib"]["mean"],
-                "comparison": ("%s vs %s" % (comparison["candidate"], comparison["reference"])
-                               if comparison else ""),
-                "speedup": comparison.get("speedup"),
-                "speedup_ci95_low": speedup_ci[0], "speedup_ci95_high": speedup_ci[1],
-                "percent_time_reduction": comparison.get("percent_time_reduction"),
-                "shapiro_w": comparison.get("shapiro_w"), "shapiro_p": comparison.get("shapiro_p"),
-                "test": comparison.get("test"),
-                "p_value": comparison.get("p_value"), "p_holm": comparison.get("p_holm"),
-                "cohens_d": comparison.get("cohens_d"),
-                "effect_magnitude": comparison.get("effect_magnitude"),
-                "verdict": comparison.get("verdict", "reference condition"),
-            })
+    for code, item in report["summary"].items():
+        stats = item["elapsed_ms"]
+        ci = stats["ci95"] or [None, None]
+        comparison = comparisons.get(code, {})
+        rows.append({
+            "configuration": code, "label": item["label"], "trials": stats["n"],
+            "mean_ms": stats["mean"], "sd_ms": stats["stdev"],
+            "ci95_low_ms": ci[0], "ci95_high_ms": ci[1], "cv_percent": stats["cv_percent"],
+            "mean_throughput_mib_s": item["throughput_mib_s"]["mean"],
+            "mean_cpu_percent": item["cpu_percent"]["mean"],
+            "mean_peak_rss_mib": item["peak_rss_mib"]["mean"],
+            "speedup_vs_c0": comparison.get("speedup", references.get(code, {}).get("speedup_vs_c0")),
+            "percent_reduction": comparison.get("percent_time_reduction"),
+            "shapiro_p": comparison.get("shapiro_p"), "test": comparison.get("test"),
+            "p_value": comparison.get("p_value"), "p_holm": comparison.get("p_holm"),
+            "cohens_d": comparison.get("cohens_d"),
+            "verdict": comparison.get("verdict", "baseline" if code == "C0" else "reference point"),
+        })
     return rows
 
 
-def write_summary_csv(path: os.PathLike[str] | str, report: Dict[str, Any]) -> None:
-    rows = summary_rows(report)
+def _write_csv(path: os.PathLike[str] | str, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
     with open(path, "w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1235,8 +1053,8 @@ def export_report(report: Dict[str, Any], folder: os.PathLike[str] | str, stem: 
         "summary_csv": str(folder / (stem + "_summary.csv")),
     }
     Path(paths["json"]).write_text(json.dumps(report, indent=2), encoding="utf-8")
-    write_runs_csv(paths["runs_csv"], report["runs"])
-    write_summary_csv(paths["summary_csv"], report)
+    _write_csv(paths["runs_csv"], report["runs"])
+    _write_csv(paths["summary_csv"], summary_rows(report))
     return paths
 
 
@@ -1396,17 +1214,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pass
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="experiment", required=True)
-    for name in ("large", "small"):
-        command = sub.add_parser(name)
-        command.add_argument("paths", nargs="+", help="files, or one folder for 'small'")
-        command.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
-        command.add_argument("--warmups", type=int, default=DEFAULT_WARMUPS)
-        command.add_argument("--output", default=".", help="folder for JSON/CSV results")
-        if name == "large":
-            command.add_argument("--no-references", action="store_true")
-        else:
-            command.add_argument("--workers", type=int)
-            command.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    trials = sub.add_parser("trials", help="run the Table 8 configurations on files or a folder")
+    trials.add_argument("paths", nargs="+", help="evidence files and/or folders (searched recursively)")
+    trials.add_argument("--configurations", nargs="+", default=list(DEFAULT_CONFIGURATION_CODES),
+                        choices=list(DEFAULT_CONFIGURATION_CODES))
+    trials.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
+    trials.add_argument("--warmups", type=int, default=1)
+    trials.add_argument("--output", default=".", help="folder for JSON/CSV results")
     autopsy = sub.add_parser("autopsy", help="analyze the trials CSV written by the Autopsy module")
     autopsy.add_argument("trials_csv")
     autopsy.add_argument("--output", default=".", help="folder for JSON/CSV results")
@@ -1430,19 +1244,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     printer = lambda message, fraction: print("[%5.1f%%] %s" % (fraction * 100, message), file=sys.stderr)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    if args.experiment == "large":
-        report = run_large_file_ablation(
-            args.paths, trials=args.trials, warmups=args.warmups,
-            include_references=not args.no_references, progress=printer)
-        written = export_report(report, args.output, "large_file_ablation_" + stamp)
-    else:
-        paths = args.paths
-        if len(paths) == 1 and os.path.isdir(paths[0]):
-            paths = [str(p) for p in sorted(Path(paths[0]).rglob("*")) if p.is_file()]
-        report = run_small_file_ablation(
-            paths, trials=args.trials, warmups=args.warmups,
-            workers=args.workers, batch_size=args.batch_size, progress=printer)
-        written = export_report(report, args.output, "small_file_ablation_" + stamp)
+    paths: List[str] = []
+    for path in args.paths:
+        if os.path.isdir(path):
+            paths.extend(str(p) for p in sorted(Path(path).rglob("*")) if p.is_file())
+        else:
+            paths.append(path)
+    report = run_configuration_trials(paths, configurations=args.configurations, trials=args.trials,
+                                      warmups=args.warmups, progress=printer)
+    written = export_report(report, args.output, "technique_evaluation_" + stamp)
     print(json.dumps(written, indent=2))
     return 0
 

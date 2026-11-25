@@ -32,7 +32,7 @@ class VerificationTests(unittest.TestCase):
             result = validation.configuration_consistency(path)
         self.assertTrue(result["passed"], result["mismatches"])
         variants = [o["variant"] for o in result["observations"]]
-        self.assertTrue(any("batched" in v for v in variants))
+        self.assertTrue(any("batch request" in v for v in variants))
 
     def test_avalanche_equation_13(self):
         inputs = validation.random_inputs(300, 4096, seed=1)
@@ -147,8 +147,8 @@ class ScaleDatasetTests(unittest.TestCase):
 
     def test_planned_read_volume(self):
         import benchmark_blake3
-        self.assertEqual(benchmark_blake3.planned_read_bytes([10, 20], trials=30, warmups=2), 30 * 6 * 32)
-        self.assertEqual(benchmark_blake3.planned_read_bytes([10], 10, 0, include_references=False), 400)
+        self.assertEqual(benchmark_blake3.planned_read_bytes([10, 20], trials=30, warmups=1), 30 * 7 * 31)
+        self.assertEqual(benchmark_blake3.planned_read_bytes([10], 10, 0, configurations=4), 400)
 
 
 if __name__ == "__main__":

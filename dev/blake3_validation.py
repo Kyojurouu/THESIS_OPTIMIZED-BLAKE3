@@ -56,14 +56,13 @@ from optimized_blake3 import (
     BLAKE3_CONFIGS,
     MIB,
     SMALL_FILE_LIMIT,
-    _small_batch_worker,
-    _small_file_worker,
     hash_file,
     hash_file_config,
     hash_stream,
     hash_stream_profile,
     serve_forever,
     STREAM_CONFIG_PROFILES,
+    _small_file_task,
     logical_cpu_count,
     physical_cpu_count,
     self_test,
@@ -486,8 +485,7 @@ def configuration_consistency(
             for line, label in zip(response.getvalue().splitlines(), ("C4", "C0")):
                 observe("Autopsy batch request (%s profile)" % label, json.loads(line).get("digest", ""))
         if size < SMALL_FILE_LIMIT:
-            observe("small-file worker (unbatched)", _small_file_worker(str(file_path))[0])
-            observe("small-file worker (batched)", _small_batch_worker([str(file_path)])[0][0])
+            observe("Hash Files small-file task", _small_file_task(str(file_path))["digest"])
         if progress:
             progress("Consistency checks complete", 1.0)
         mismatches = [o["variant"] for o in observations if not o["matches"]]

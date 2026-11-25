@@ -14,91 +14,69 @@ metrics = bench  # formulas and statistics live in benchmark_blake3
 from optimized_blake3 import SMALL_FILE_LIMIT
 
 
-class LargeFileAblationTests(unittest.TestCase):
+class ConfigurationTrialsTests(unittest.TestCase):
+    """Technique evaluation of thesis Table 8 through the engine data stream."""
+
     @classmethod
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
-        cls.path = Path(cls.directory.name, "sample.pdf")
-        cls.payload = os.urandom(3 * 1024 * 1024 + 11)
-        cls.path.write_bytes(cls.payload)
-        cls.report = bench.run_large_file_ablation([cls.path], trials=6, warmups=1)
+        root = Path(cls.directory.name)
+        cls.paths = []
+        for index in range(40):
+            path = root / ("doc%02d.txt" % index)
+            path.write_bytes(os.urandom(500 + index * 301))
+            cls.paths.append(path)
+        large = root / "video.mp4"
+        large.write_bytes(os.urandom(SMALL_FILE_LIMIT + 1234))
+        cls.paths.append(large)
+        cls.report = bench.run_configuration_trials(cls.paths, trials=4, warmups=1)
 
     @classmethod
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def test_all_conditions_and_comparisons_present(self):
-        file_report = self.report["files"][0]
-        self.assertEqual(
-            list(file_report["conditions"]),
-            ["baseline", "buffer_only", "threads_only", "optimized", "md5", "sha256"],
-        )
-        technique = [c for c in file_report["comparisons"] if c["family"] == "technique"]
-        reference = [c for c in file_report["comparisons"] if c["family"] == "reference"]
-        self.assertEqual([c["candidate"] for c in technique],
-                         ["buffer_only", "threads_only", "optimized"])
-        self.assertEqual({c["reference"] for c in reference}, {"sha256", "md5"})
-        for comparison in technique + reference:
+    def test_all_seven_configurations_run(self):
+        self.assertEqual(list(self.report["summary"]), ["C0", "C1", "C2", "C3", "C4", "R1", "R2"])
+        self.assertEqual([c["candidate"] for c in self.report["comparisons"]], ["C1", "C2", "C3", "C4"])
+        for comparison in self.report["comparisons"]:
+            self.assertIn(comparison["test"], ("paired t-test", "Wilcoxon signed-rank"))
             self.assertIn("p_holm", comparison)
-            self.assertIn(comparison["verdict"], (
-                "significantly faster", "significantly slower", "no significant difference"))
-            self.assertEqual(len(comparison["speedup_ci95"]), 2)
+        self.assertEqual({r["reference"] for r in self.report["references"]}, {"R1", "R2"})
 
-    def test_digest_is_standard_blake3(self):
-        self.assertEqual(self.report["files"][0]["blake3_digest"],
-                         blake3.blake3(self.payload).hexdigest())
+    def test_order_is_rotated_per_trial_block(self):
+        firsts = [r["condition"] for r in self.report["runs"] if r["position"] == 1]
+        self.assertEqual(firsts, ["C0", "C1", "C2", "C3"])
+        for block in range(1, 5):
+            self.assertEqual(sorted(r["condition"] for r in self.report["runs"] if r["trial_block"] == block),
+                             ["C0", "C1", "C2", "C3", "C4", "R1", "R2"])
 
-    def test_every_condition_runs_once_per_round(self):
-        runs = self.report["runs"]
-        self.assertEqual(len(runs), 6 * 6)
-        for round_number in range(1, 7):
-            positions = sorted(r["position"] for r in runs if r["round"] == round_number)
-            self.assertEqual(positions, list(range(1, 7)))
-        self.assertTrue(all(not r["warmup"] for r in runs))
+    def test_threading_applies_and_amdahl_reported(self):
+        self.assertIn("C4", self.report["amdahl"])
+        self.assertEqual(self.report["workload"]["large_files"], 1)
+        self.assertEqual(self.report["workload"]["small_files"], 40)
 
-    def test_below_threshold_file_flags_threading(self):
-        self.assertLess(self.path.stat().st_size, SMALL_FILE_LIMIT)
-        self.assertEqual(self.report["files"][0]["conditions"]["threads_only"]["threads"], 1)
-        self.assertTrue(any("threshold" in w for w in self.report["files"][0]["warnings"]))
-
-    def test_export_writes_three_files(self):
+    def test_size_tier_table_and_export(self):
+        tiers = {row["size_tier"] for row in self.report["size_tiers"]}
+        self.assertTrue(any(t.startswith("T4") for t in tiers))
         with tempfile.TemporaryDirectory() as out:
             paths = bench.export_report(self.report, out, "test")
             for path in paths.values():
                 self.assertTrue(Path(path).stat().st_size > 0)
 
-    def test_backward_compatible_percent(self):
-        self.assertEqual(bench.optimization_percent(10.0, 7.5), 25.0)
-
-
-class SmallFileAblationTests(unittest.TestCase):
-    def test_four_modes_with_identical_digests(self):
-        with tempfile.TemporaryDirectory() as directory:
-            paths = []
-            for index in range(40):
-                path = Path(directory, "f%02d.txt" % index)
-                path.write_bytes(os.urandom(500 + index * 101))
-                paths.append(path)
-            report = bench.run_small_file_ablation(paths, trials=3, warmups=1, workers=2,
-                                                   batch_size=8)
-        self.assertEqual(list(report["summary"]),
-                         ["sequential", "sequential_batched", "parallel", "parallel_batched"])
-        self.assertEqual(len(report["comparisons"]), 3)
-        self.assertEqual(report["workload"]["files"], 40)
-        for comparison in report["comparisons"]:
-            self.assertIn(comparison["test"], ("paired t-test", "Wilcoxon signed-rank"))
-        self.assertTrue(any("preliminary" in w for w in report["warnings"]))
+    def test_c0_is_required_and_subsets_work(self):
+        with self.assertRaises(ValueError):
+            bench.run_configuration_trials(self.paths[:3], configurations=["C1"], trials=1)
+        report = bench.run_configuration_trials(self.paths[:3], configurations=["C0", "C2"], trials=3,
+                                                warmups=0)
+        self.assertEqual(list(report["summary"]), ["C0", "C2"])
+        self.assertTrue(any("Multithreading" in w or "multithreading" in w for w in report["warnings"]))
 
     def test_cancellation(self):
         import threading
         cancel = threading.Event()
         cancel.set()
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "a.bin")
-            path.write_bytes(b"x" * 1000)
-            with self.assertRaises(bench.BenchmarkCancelled):
-                bench.run_large_file_ablation([path], trials=2, warmups=0, cancel=cancel)
-
+        with self.assertRaises(bench.BenchmarkCancelled):
+            bench.run_configuration_trials(self.paths[:2], trials=2, warmups=0, cancel=cancel)
 
 
 class IndicatorTests(unittest.TestCase):

@@ -248,23 +248,39 @@ class TechniqueConfigTests(unittest.TestCase):
                 self.assertEqual(result.digest, hashlib.new(algorithm, payload).hexdigest())
                 self.assertEqual(result.chunk_size, engine.MIB)
 
-    def test_small_file_modes_agree(self):
+    def test_engine_session_matches_autopsy_behaviour(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = []
-            for index in range(25):
+            for index in range(5):
                 path = Path(directory, "s%d" % index)
-                path.write_bytes(os.urandom(100 + index * 50))
+                path.write_bytes(os.urandom(100 + index * 999))
                 paths.append(str(path))
-            expected = [(blake3.blake3(Path(p).read_bytes()).hexdigest(), os.path.getsize(p))
-                        for p in paths]
-            pool, startup = engine.make_worker_pool(2)
-            try:
-                for mode in engine.SMALL_FILE_MODES:
-                    self.assertEqual(engine.hash_small_files(paths, mode, pool=pool, batch_size=4),
-                                     expected, mode.key)
-            finally:
-                pool.shutdown()
-            self.assertGreater(startup, 0)
+            big = Path(directory, "big")
+            big.write_bytes(os.urandom(engine.SMALL_FILE_LIMIT + 7))
+            paths.append(str(big))
+            expected = [blake3.blake3(Path(p).read_bytes()).hexdigest() for p in paths]
+            with engine.EngineSession() as session:
+                for configuration in engine.TABLE8_CONFIGURATIONS:
+                    results = session.hash_set(paths, configuration)
+                    if configuration["algorithm"] == "BLAKE3":
+                        self.assertEqual([r["digest"] for r in results], expected, configuration["code"])
+                    threaded = configuration["code"] in ("C3", "C4")
+                    self.assertEqual(results[-1]["threads_used"],
+                                     engine.physical_cpu_count() if threaded else 1, configuration["code"])
+
+    def test_table8_matches_the_autopsy_module(self):
+        import ast
+        plugin = (Path(__file__).resolve().parents[2] / "autopsy_plugin" / "BLAKE3_Autopsy_Module"
+                  / "blake3_ingest_module.py")
+        tree = ast.parse(plugin.read_text(encoding="utf-8"))
+        node = next(n for n in tree.body if isinstance(n, ast.Assign)
+                    and getattr(n.targets[0], "id", "") == "CONFIGURATIONS")
+        module_table = ast.literal_eval(node.value)
+        for configuration in engine.TABLE8_CONFIGURATIONS:
+            expected = dict(configuration)
+            code = expected.pop("code")
+            self.assertEqual(module_table[code], expected, code)
+        self.assertEqual(set(module_table), set(engine.TABLE8_BY_CODE))
 
 
 class PipelineAndFallbackTests(unittest.TestCase):

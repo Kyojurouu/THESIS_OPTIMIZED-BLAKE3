@@ -7,7 +7,7 @@ and hashing the resulting digests is *not* equivalent to BLAKE3 and is never
 done here.
 
 The public API is ``hash_file()``, ``hash_stream()``, ``hash_file_config()``,
-``hash_small_files()`` and, for everyday multi-file hashing with hash lists,
+and, for everyday multi-file hashing with hash lists,
 ``hash_paths()`` / ``write_hash_report()`` / ``verify_hash_list()``.  The
 ``--server`` mode is the persistent data stream used by the Autopsy/Jython
 ingest module (thesis Section 3.4):
@@ -1307,64 +1307,10 @@ def hash_file_reference(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Small-file workloads: batched processing
+# Worker pool for everyday small-file hashing (Hash Files page)
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_BATCH_SIZE = 32
-
-
-@dataclass(frozen=True)
-class SmallFileMode:
-    """One cell of the small-file factorial design (parallel × batched)."""
-
-    key: str
-    label: str
-    parallel: bool
-    batched: bool
-
-
-SMALL_FILE_MODES: Tuple[SmallFileMode, ...] = (
-    SmallFileMode("sequential", "Sequential per-file (baseline)", False, False),
-    SmallFileMode("sequential_batched", "Batched only (single process)", False, True),
-    SmallFileMode("parallel", "Parallel per-file dispatch only", True, False),
-    SmallFileMode("parallel_batched", "Optimized (parallel + batched)", True, True),
-)
-SMALL_MODES_BY_KEY: Dict[str, SmallFileMode] = {mode.key: mode for mode in SMALL_FILE_MODES}
-
-
-def _hash_small_file(path: str, buffer: Optional[bytearray] = None) -> Tuple[str, int]:
-    """Hash one small file single-threaded; returns (hex digest, bytes read).
-
-    Unbatched callers pass ``buffer=None`` so each file pays its own buffer
-    allocation and hasher set-up, exactly as an independent per-file job would.
-    """
-    hasher = _native_hasher(1)
-    if buffer is None:
-        size = os.path.getsize(path)
-        buffer = bytearray(adaptive_chunk_size(size))
-    view = memoryview(buffer)
-    total = 0
-    try:
-        with open(path, "rb", buffering=0) as source:
-            while True:
-                count = source.readinto(view)
-                if not count:
-                    break
-                hasher.update(view[:count])
-                total += count
-    finally:
-        view.release()
-    return hasher.hexdigest(), total
-
-
-def _small_file_worker(path: str) -> Tuple[str, int]:
-    return _hash_small_file(path)
-
-
-def _small_batch_worker(paths: Sequence[str]) -> List[Tuple[str, int]]:
-    # One reusable buffer and one task round-trip for the whole batch.
-    buffer = bytearray(adaptive_chunk_size(SMALL_FILE_LIMIT - 1))
-    return [_hash_small_file(path, buffer) for path in paths]
 
 
 def _worker_ready() -> int:
@@ -1389,34 +1335,6 @@ def make_worker_pool(workers: Optional[int] = None) -> Tuple[ProcessPoolExecutor
 def chunked(items: Sequence[str], size: int) -> List[List[str]]:
     size = max(1, int(size))
     return [list(items[i:i + size]) for i in range(0, len(items), size)]
-
-
-def hash_small_files(
-    paths: Sequence[str],
-    mode: SmallFileMode | str,
-    *,
-    pool: Optional[ProcessPoolExecutor] = None,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-) -> List[Tuple[str, int]]:
-    """Hash a small-file workload in one factorial mode, preserving order."""
-    if isinstance(mode, str):
-        mode = SMALL_MODES_BY_KEY[mode]
-    items = [str(path) for path in paths]
-    if mode.parallel:
-        if pool is None:
-            raise ValueError("parallel modes require a worker pool")
-        if mode.batched:
-            results: List[Tuple[str, int]] = []
-            for batch_result in pool.map(_small_batch_worker, chunked(items, batch_size)):
-                results.extend(batch_result)
-            return results
-        return list(pool.map(_small_file_worker, items))
-    if mode.batched:
-        results = []
-        for batch in chunked(items, batch_size):
-            results.extend(_small_batch_worker(batch))
-        return results
-    return [_small_file_worker(path) for path in items]
 
 
 def self_test() -> Dict[str, Any]:
@@ -1560,6 +1478,144 @@ def _serve_batch(
     # Write all N result lines then flush exactly once.
     sink.write(b"".join(result_lines))
     sink.flush()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Thesis Table 8 configurations and a client of the --server data stream
+# ─────────────────────────────────────────────────────────────────────────────
+# The same seven configurations as the Autopsy module (blake3_ingest_module.py
+# CONFIGURATIONS; a unit test keeps the two identical).
+
+TABLE8_CONFIGURATIONS: Tuple[Dict[str, Any], ...] = (
+    {"code": "C0", "label": "C0 Baseline BLAKE3", "profile": "blake3_baseline",
+     "adaptive_buffer": False, "batching": False, "algorithm": "BLAKE3"},
+    {"code": "C1", "label": "C1 Buffer sizing only", "profile": "blake3_buffer_only",
+     "adaptive_buffer": True, "batching": False, "algorithm": "BLAKE3"},
+    {"code": "C2", "label": "C2 Batching only", "profile": "blake3_baseline",
+     "adaptive_buffer": False, "batching": True, "algorithm": "BLAKE3"},
+    {"code": "C3", "label": "C3 Threading only", "profile": "blake3_threads_only",
+     "adaptive_buffer": False, "batching": False, "algorithm": "BLAKE3"},
+    {"code": "C4", "label": "C4 Full optimized implementation", "profile": "blake3_optimized",
+     "adaptive_buffer": True, "batching": True, "algorithm": "BLAKE3"},
+    {"code": "R1", "label": "R1 MD5 (reference)", "profile": "md5",
+     "adaptive_buffer": False, "batching": False, "algorithm": "MD5"},
+    {"code": "R2", "label": "R2 SHA-256 (reference)", "profile": "sha256",
+     "adaptive_buffer": False, "batching": False, "algorithm": "SHA-256"},
+)
+TABLE8_BY_CODE: Dict[str, Dict[str, Any]] = {c["code"]: c for c in TABLE8_CONFIGURATIONS}
+BATCH_WINDOW = 32  # files below SMALL_FILE_LIMIT per batched request (Section 3.4)
+
+
+def transfer_buffer(size_bytes: int, adaptive: bool) -> int:
+    """Bytes read from the evidence per write to the engine (Table 7 or fixed 1 MiB)."""
+    return adaptive_chunk_size(size_bytes) if adaptive else FIXED_BUFFER_BYTES
+
+
+class EngineSession:
+    """Client of the persistent ``--server`` data stream (thesis Section 3.4).
+
+    Mirrors the Autopsy module: the engine is started once, every file is sent
+    as raw bytes read in the configured transfer buffer, and small files can be
+    grouped into one batched request. Used by the standalone Technique
+    Evaluation so it measures exactly what the Autopsy module measures.
+    """
+
+    def __init__(self, command: Optional[Sequence[str]] = None) -> None:
+        import subprocess
+        self.command = list(command or [sys.executable, str(Path(__file__).resolve()), "--server"])
+        creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        bufsize=0, creationflags=creation)
+        result = self.hash_bytes(b"", "blake3_optimized")
+        if result.get("digest") != KNOWN_VECTORS[b""]:
+            self.close()
+            raise RuntimeError("engine self-test failed: %s" % result)
+
+    def _write_file(self, path: str, size: int, adaptive: bool) -> None:
+        chunk = transfer_buffer(size, adaptive)
+        buffer = bytearray(max(1, chunk))
+        view = memoryview(buffer)
+        remaining = size
+        with open(path, "rb", buffering=0) as source:
+            while remaining:
+                count = source.readinto(view[:min(chunk, remaining)])
+                if not count:
+                    raise IOError("short read: %s changed while it was being sent" % path)
+                self.process.stdin.write(view[:count])
+                remaining -= count
+
+    def _read_result(self) -> Dict[str, Any]:
+        line = self.process.stdout.readline()
+        if not line:
+            raise RuntimeError("the engine closed the data stream")
+        return json.loads(line)
+
+    def hash_bytes(self, data: bytes, profile: str) -> Dict[str, Any]:
+        header = json.dumps({"size": len(data), "profile": profile}).encode("ascii") + b"\n"
+        self.process.stdin.write(header + data)
+        self.process.stdin.flush()
+        return self._read_result()
+
+    def hash_file(self, path: str, profile: str, adaptive: bool) -> Dict[str, Any]:
+        size = os.path.getsize(path)
+        self.process.stdin.write(json.dumps({"size": size, "profile": profile}).encode("ascii") + b"\n")
+        self._write_file(path, size, adaptive)
+        self.process.stdin.flush()
+        return self._read_result()
+
+    def hash_batch(self, paths: Sequence[str], profile: str, adaptive: bool) -> List[Dict[str, Any]]:
+        sizes = [os.path.getsize(p) for p in paths]
+        header = {"batch": len(paths), "requests": [{"size": s, "profile": profile} for s in sizes]}
+        self.process.stdin.write(json.dumps(header).encode("ascii") + b"\n")
+        for path, size in zip(paths, sizes):
+            self._write_file(path, size, adaptive)
+        self.process.stdin.flush()
+        return [self._read_result() for _ in paths]
+
+    def hash_set(self, paths: Sequence[str], configuration: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Hash every file the way the Autopsy module does under ``configuration``.
+
+        Batching configurations send files below SMALL_FILE_LIMIT in groups of up
+        to BATCH_WINDOW; every other file is one request. Results keep input order.
+        """
+        profile, adaptive = configuration["profile"], configuration["adaptive_buffer"]
+        results: Dict[int, Dict[str, Any]] = {}
+        pending: List[int] = []
+
+        def flush() -> None:
+            for index, result in zip(pending, self.hash_batch([paths[i] for i in pending],
+                                                              profile, adaptive)):
+                results[index] = result
+            pending.clear()
+
+        for index, path in enumerate(paths):
+            if configuration["batching"] and os.path.getsize(path) < SMALL_FILE_LIMIT:
+                pending.append(index)
+                if len(pending) >= BATCH_WINDOW:
+                    flush()
+            else:
+                results[index] = self.hash_file(path, profile, adaptive)
+        if pending:
+            flush()
+        return [results[i] for i in range(len(paths))]
+
+    def close(self) -> None:
+        try:
+            self.process.stdin.close()
+            self.process.wait(timeout=10)
+        except Exception:
+            self.process.kill()
+        finally:
+            try:
+                self.process.stdout.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "EngineSession":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
 
 
 def _benchmark(paths: Sequence[str], rounds: int, threads: Optional[int]) -> Dict[str, Any]:
