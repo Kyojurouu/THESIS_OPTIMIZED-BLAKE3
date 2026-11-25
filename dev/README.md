@@ -1,187 +1,85 @@
-# Optimized BLAKE3 Autopsy Module
+# Optimized BLAKE3 engine and Autopsy ingest module
 
-> **Note (Thesis 2):** the standalone application (`main_app.py` with `optimized_blake3.py`,
-> `benchmark_blake3.py`, `blake3_validation.py`, `dataset_tool.py`) is now the primary
-> deliverable; see the root `README.md`. This file documents the Autopsy plugin.
+Implements thesis Chapter 3, Sections 3.4–3.5.
 
-This directory contains a standards-compliant native BLAKE3 engine, an Autopsy
-4.x Jython bridge, a fair benchmarking harness, and cryptographic integrity
-checks for the thesis **“Performance Optimization for BLAKE3 for Multi-Format
-File Hashing in Digital Forensic Investigations.”**
+## Components
 
-## Architecture
+| File | Role |
+|---|---|
+| `optimized_blake3.py` | Hashing engine (Figure 3). `--server` is the persistent data stream used by Autopsy. |
+| `../autopsy_plugin/BLAKE3_Autopsy_Module/blake3_ingest_module.py` | Jython 2.7 file + data source ingest module (Figure 4). |
+| `../autopsy_plugin/BLAKE3_Autopsy_Module/optimized_blake3_hasher.exe` | Packaged engine (PyInstaller one-file build of `optimized_blake3.py`). |
+| `benchmark_blake3.py` | Equations 1–19, the Section 3.5 statistics, and `autopsy` trial analysis. |
+| `blake3_validation.py` | V1–V3 correctness checks and H1–H4 hash-behaviour tests. |
+| `build_sidecar.ps1` | Builds and self-tests the engine executable. |
+| `tests/` | Unit tests, plus `test_autopsy_module_flow.py`, which runs the ingest module under CPython with stand-in Autopsy classes against the real engine. |
 
-- `optimized_blake3.py` — CPython/native engine and persistent sidecar protocol.
-- `blake3_ingest_module.py` — Autopsy/Jython file and data-source ingest module.
-- `optimized_blake3_hasher.exe` — packaged sidecar used by Autopsy.
-- `benchmark_blake3.py` — JSON/CSV benchmark with equal timing scope.
-- `blake3_validation.py` — published vectors, deterministic consistency,
-  avalanche diagnostic, and empirical collision screen.
-- `tests/` — regression tests.
-- `build_sidecar.ps1` — reproducible PyInstaller build command.
+## Engine stream protocol
 
-The engine uses the official `blake3` native extension. Its backend performs
-standards-compliant BLAKE3 Merkle-tree parallelism and runtime SIMD dispatch.
-The code does **not** combine independently computed chunk digests, because
-that would produce a non-standard algorithm.
-
-### Adaptive policy
-
-| File size | I/O buffer | Parallel policy |
-|---|---:|---|
-| `< 1 MiB` | 64 KiB | one native thread |
-| `1–16 MiB` | 256 KiB | one native thread |
-| `16–64 MiB` | 2 MiB | physical-core native tree parallelism |
-| `64–256 MiB` | 8 MiB | physical-core native tree parallelism |
-| `256 MiB–2 GiB` | 8 MiB | mmap + physical-core native parallelism |
-| `>= 2 GiB` | 16 MiB | mmap + physical-core native parallelism |
-
-Local file hashing enables mmap at 64 MiB. Autopsy evidence cannot generally be
-memory-mapped because `AbstractFile`/`DataSource` is a virtual content stream;
-the bridge instead uses reusable Java `byte[]` buffers and one native bulk pipe
-write per read. Multiple independent local files can use
-`ProcessPoolExecutor`; each worker is restricted to one native BLAKE3 thread to
-avoid nested oversubscription. A single large file uses native BLAKE3 tree
-parallelism.
-
-### Thesis comparison profiles
-
-During Autopsy ingest, every readable content object receives Optimized
-BLAKE3. Correctness comparisons use the first three readable files in each
-category. The performance cohort is separate: it includes up to 10 files per
-category that are at least 16 MiB, which is the point where the optimized
-profile activates native tree parallelism. This prevents thousands of tiny
-file/IPC calls from being presented as a bulk hashing benchmark. The complete
-evidence source is also compared. Each measured profile uses the same sidecar
-protocol and end-to-end measurement scope:
-
-If the eligible internal-file cohort totals less than 64 MiB, the Algorithm
-Comparison table uses the complete evidence source instead. This is recorded as
-an evidence-source fallback and prevents a few small files from producing an
-unstable or misleading throughput ranking.
-
-1. Optimized BLAKE3: adaptive buffer and native multithreaded tree hashing.
-2. Baseline BLAKE3: fixed 1 MiB buffer and one native BLAKE3 thread.
-3. SHA-256: fixed 1 MiB independent reference pass.
-4. SHA-1: fixed 1 MiB independent reference pass.
-5. MD5: fixed 1 MiB independent reference pass.
-
-Baseline and Optimized BLAKE3 must produce the same digest for every comparison
-sample. A mismatch prevents that optimized artifact from being posted. Set
-`BLAKE3_COMPARE_EVERY_FILE=1` only for a controlled benchmark corpus; doing so
-causes five complete reads of every file and can greatly extend ingest. The
-Python BLAKE3 API does not expose
-a runtime scalar/SIMD-off switch, so native SIMD dispatch is held constant in
-both BLAKE3 profiles; the experimental treatment factors are adaptive buffering
-and multithreaded tree execution. Building a separately compiled scalar backend
-would be required to isolate SIMD as an independent factor.
-
-## Build and validate the sidecar
-
-The checked-in executable was built from the new source and precision metric
-schema. Rebuild it on the controlled examination/benchmark host when required:
-
-```powershell
-.\build_sidecar.ps1
-.\dist\optimized_blake3_hasher.exe --self-test
+```
+{"size": N, "profile": P}\n<N bytes>
+{"batch": M, "requests": [{"size": N0, "profile": P0}, ...]}\n<N0 + N1 + ... bytes>
 ```
 
-After validation, replace `optimized_blake3_hasher.exe` with the file from
-`dist`. Record the executable SHA-256 in the thesis and case notes; the Autopsy
-report records it automatically.
+One JSON result line per file, in request order (digest, status, elapsed time, throughput, CPU
+utilization as the mean of 10 ms psutil samples with their count, peak RSS, threads, buffer size,
+I/O strategy). Profiles: `blake3_baseline` (C0, C2), `blake3_buffer_only` (C1),
+`blake3_threads_only` (C3), `blake3_optimized` (C4), `md5` (R1), `sha256` (R2), `sha1`. An
+unknown profile's bytes are consumed and an error is returned, so the stream stays synchronized.
 
-For development:
+## Ingest module behaviour
 
-```powershell
-python -m pip install -r requirements.txt
-python optimized_blake3.py --self-test
-python -m unittest discover -s tests -v
-python blake3_validation.py
-```
+- **Startup** (each module instance): start the engine once; check the empty-input BLAKE3 test
+  vector; send a batch probe; probe every engine profile the job needs; stop the job if a check
+  fails. A broken stream restarts the engine and repeats the check.
+- **Settings panel:** configuration C0–C4 / R1 / R2 (Table 8), trial block (0 = not a measured
+  trial), and whether to run the verification passes. Environment fallbacks:
+  `BLAKE3_CONFIGURATION`, `BLAKE3_TRIAL_BLOCK`, `BLAKE3_VERIFICATION_PASSES`.
+- **Files:** directories and unallocated/unused space blocks are recorded as SKIPPED with a
+  reason. C2 and C4 collect up to 32 files below 32 MiB per ingest thread and send them in one
+  request (a partial batch is sent when the thread finishes); everything else is one request per
+  file. Bytes are read from Autopsy into a buffer of the configured size (Table 7 or 1 MiB) and
+  written straight to the engine. Every result is checked for the exact byte count and a digest
+  of the right length. Batch time is divided among the batch's files by size (BATCH-EST).
+- **Verification passes** (optional, after hashing): baseline BLAKE3, then MD5, then SHA-256, each
+  a separate full pass with a fixed 1 MiB buffer. A BLAKE3 configuration whose digest differs from
+  baseline BLAKE3 is marked as an error. MD5/SHA-256 are compared with hashes stored by Autopsy
+  when available.
+- **Evidence source:** one untimed warm-up pass, then the timed pass (digests must match), then
+  the verification passes.
+- **Results:** BLAKE3 Hash (Optimized) artifacts are posted after the data source analysis
+  completes (R1/R2 runs post none). The HTML/JSON report goes to the case Reports folder and is
+  registered in Autopsy; one row per run is appended to the trials CSV
+  (`%USERPROFILE%\BLAKE3_Trials\autopsy_trials.csv`, or `BLAKE3_TRIALS_CSV`), with completeness
+  (Eq. 12), digest agreement (Eq. 11), file and evidence times, throughput, run CPU (Eq. 5) and
+  peak RSS.
 
-## Autopsy installation
-
-1. In Autopsy, open **Tools → Python Plugins**.
-2. Copy this whole folder into the Python modules directory.
-3. Ensure the newly built executable is beside `blake3_ingest_module.py`.
-4. Restart Autopsy.
-5. Enable **Optimized BLAKE3 Hasher** during ingest.
-
-The module hashes the complete data source and every eligible file, including
-zero-byte files. By default it creates **BLAKE3 Hash (Optimized)** artifacts for
-the complete data source and every successfully hashed file. Set
-`BLAKE3_POST_ALL_FILE_ARTIFACTS=0` to restrict file artifacts to comparison
-results when sampled comparison mode is enabled; all optimized per-file
-results remain in the HTML/JSON audit log.
-
-Build `2026-10-08-deferred-artifact-publishing-r1` queues artifacts in memory
-during ingest and publishes them only after the matching successful
-data-source-analysis-completed event (or matching job-completed fallback).
-This avoids the observed Autopsy 4.22.1 lock cycle between `newArtifact()` and
-image-import finalization. Artifact publishing then runs on a background
-thread; the report is generated after that queue is drained. Consequently,
-hash artifacts and the report appear after analysis, not progressively during
-import. Publication failures are recorded separately in the JSON audit's
-`artifact_errors`; they do not invalidate completed hash measurements.
-Restart Autopsy after replacing the installed Python module. An already
-deadlocked JVM cannot load this fix or recover merely by replacing the file.
-
-After artifact publishing completes, the HTML report is registered under
-**Reports** and an **Open Report / OK** dialog is displayed automatically.
-
-It independently computes Baseline BLAKE3, MD5, SHA-1, and SHA-256 for the
-stratified thesis comparison and records digest, execution time, throughput,
-normalized CPU utilization, and peak RSS for each profile. The sample limit can
-be changed with `BLAKE3_COMPARISON_SAMPLE_LIMIT`; the performance threshold can
-be changed with `BLAKE3_PERFORMANCE_MIN_BYTES`.
-
-Before measuring the complete evidence source, the module performs one
-unmeasured Optimized BLAKE3 warm-up pass and verifies that its digest matches
-the measured pass. This gives BLAKE3 and the reference algorithms the same
-warmed Autopsy/libewf/operating-system cache condition. Set
-`BLAKE3_EVIDENCE_CACHE_WARMUP=0` only when a documented cold-cache protocol is
-being controlled externally.
-
-The MD5/SHA-1/SHA-256 timings are independent, same-scope measurements of the
-algorithms Autopsy supports; they are not timing values exported by Autopsy's
-built-in hashing module. At report completion, the module also checks each
-independently computed reference digest against the corresponding hash stored
-by Autopsy when that value is available. The report labels those checks
-`AUTOPSY MATCH`, `AUTOPSY MISMATCH`, or `AUTOPSY N/A`.
-
-## Benchmarking
-
-Use at least one file from every target category and multiple rounds:
+## Build and install
 
 ```powershell
-python benchmark_blake3.py evidence\document.pdf evidence\image.jpg `
-  evidence\audio.mp3 evidence\video.mp4 evidence\program.exe evidence\disk.dd `
-  --rounds 5 --json-output benchmark.json --csv-output benchmark.csv
+.\build_sidecar.ps1 -Python C:\path\to\python.exe   # Python 3.14; installs blake3==1.0.8, psutil==7.2.2
+Copy-Item .\dist\optimized_blake3_hasher.exe ..\autopsy_plugin\BLAKE3_Autopsy_Module\
 ```
 
-Every algorithm is measured over the same scope:
-`open + mmap/read + hash + digest finalization`. Report cache state, power plan,
-CPU model, storage device, Autopsy worker count, and real-time antivirus state.
-MiB/s uses `2^20` bytes even where the Autopsy label is shortened to MB/s.
+The build script self-tests the executable. To test the packaged engine with the full module flow:
 
-Do not compare the legacy SHA `MessageDigest.update()`-only timing to BLAKE3
-end-to-end timing; those scopes differ and explain much of the apparent SHA
-advantage.
+```powershell
+$env:BLAKE3_TEST_ENGINE = "..\autopsy_plugin\BLAKE3_Autopsy_Module\optimized_blake3_hasher.exe"
+python -m pytest -q tests\test_autopsy_module_flow.py
+```
 
-## Forensic reliability notes
+Install in Autopsy: Tools → Python Plugins, copy the `BLAKE3_Autopsy_Module` folder (module,
+exe, logo) into the Python modules directory, restart Autopsy, and enable **Optimized BLAKE3
+Hasher** in the ingest module list. Record the engine SHA-256 shown in the report.
 
-- Published empty and `abc` BLAKE3-256 vectors are checked.
-- Exact expected/actual byte counts are enforced; missing bytes are never
-  padded.
-- If Autopsy returns fewer bytes than a virtual file declares (for example,
-  NTFS `$BadClus:$Bad-slack`), the item is recorded as `skipped`, no digest is
-  accepted, and the persistent native helper is restarted and self-tested.
-  This prevents the next file (often shown as `$Bitmap`) from inheriting a
-  desynchronized request stream.
-- Local files are rejected if size, modification time, or identity changes.
-- Engine version, executable SHA-256, SIMD capability, thread cap, timing scope,
-  CPU utilization, and peak RSS are auditable.
-- Re-hashing every file is disabled because it doubles ingest work without
-  strengthening BLAKE3. Independently verify selected exhibits when required by
-  lab procedure.
-- Avalanche and collision-corpus tests are diagnostics, not security proofs.
+## Notes
+
+- Autopsy reads evidence through virtual content streams, so the Autopsy path always uses the
+  buffered stream; memory mapping applies only to local files in the standalone application.
+- Keep Autopsy's file ingest thread count fixed across trials; each ingest thread runs its own
+  engine, and threaded configurations use all physical cores per large file.
+- Sampled verification (`BLAKE3_COMPARE_EVERY_FILE=0`, with `BLAKE3_COMPARISON_SAMPLE_LIMIT`,
+  `BLAKE3_INTEGRITY_SAMPLE_LIMIT`, `BLAKE3_PERFORMANCE_MIN_BYTES`) is available for very large
+  cases; the default verifies every file, as in Section 3.5.
+- Artifacts are queued during ingest and posted after the matching data-source-analysis-completed
+  event, which avoids an Autopsy 4.22.1 lock cycle between `newArtifact()` and image import.

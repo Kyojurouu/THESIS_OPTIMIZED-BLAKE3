@@ -1,16 +1,30 @@
 # -*- coding: utf-8 -*-
-"""Autopsy 4.x / Jython 2.7 ingest bridge for optimized_blake3.py.
+"""Autopsy 4.x / Jython 2.7 ingest module for the optimized BLAKE3 engine.
 
-Install this file, optimized_blake3_hasher.exe, and the README together in one
-Autopsy Python module directory.  The sidecar executable must be built from the
-version-controlled optimized_blake3.py source for the complete metric set.
+Implements the Autopsy integration of thesis Chapter 3 (Sections 3.4-3.5):
 
-The bridge never reconstructs Java bytes in Python.  It writes Autopsy's Java
-byte[] directly to the persistent process OutputStream, validates the exact
-byte count, validates the digest format, and records both engine-only and full
-Autopsy-to-engine timing scopes.
+* a file ingest module and a data source ingest module registered by one
+  factory; each instance starts the external engine (optimized_blake3_hasher.exe,
+  built from dev/optimized_blake3.py) once and talks to it over a persistent
+  data stream;
+* a per-job configuration selected in the ingest settings panel: C0 baseline,
+  C1 buffer sizing only, C2 batching only, C3 threading only, C4 full optimized
+  implementation, R1 MD5 and R2 SHA-256 (Table 8), plus a trial-block number;
+* adaptive transfer buffers (Table 7), batches of up to 32 files below 32 MiB
+  (C2, C4), and individual requests for files of 32 MiB and above;
+* exact byte-count and digest-format validation, the empty-input test vector,
+  a batch probe and a profile probe at startup, and engine restart on failure;
+* optional verification passes after hashing (baseline BLAKE3, MD5, SHA-256 in
+  separate full passes) and comparison with hashes stored by Autopsy;
+* BLAKE3 Hash (Optimized) artifacts posted after the data source analysis, an
+  HTML/JSON report in the case Reports folder, and one row per run appended to
+  a trials CSV analyzed by dev/benchmark_blake3.py (``autopsy`` command).
+
+Install this file, optimized_blake3_hasher.exe and autopsy-logo.png together in
+one Autopsy Python module directory.
 """
 
+import csv
 import datetime
 import json
 import os
@@ -29,17 +43,26 @@ from java.lang import String as JString
 from java.lang import System
 from java.security import MessageDigest
 from java.util import ArrayList
+from java.util import Vector
 from java.beans import PropertyChangeListener
 from jarray import zeros
+from javax.swing import BoxLayout
+from javax.swing import JCheckBox
+from javax.swing import JComboBox
+from javax.swing import JLabel
 from javax.swing import JOptionPane
+from javax.swing import JSpinner
+from javax.swing import SpinnerNumberModel
 from javax.swing import SwingUtilities
 
 from org.sleuthkit.autopsy.casemodule import Case
 from org.sleuthkit.autopsy.ingest import DataSourceIngestModule
 from org.sleuthkit.autopsy.ingest import FileIngestModule
+from org.sleuthkit.autopsy.ingest import GenericIngestModuleJobSettings
 from org.sleuthkit.autopsy.ingest import IngestMessage
 from org.sleuthkit.autopsy.ingest import IngestModule
 from org.sleuthkit.autopsy.ingest import IngestModuleFactoryAdapter
+from org.sleuthkit.autopsy.ingest import IngestModuleIngestJobSettingsPanel
 from org.sleuthkit.autopsy.ingest import IngestManager
 from org.sleuthkit.autopsy.ingest import IngestServices
 from org.sleuthkit.datamodel import BlackboardAttribute
@@ -47,8 +70,8 @@ from org.sleuthkit.datamodel import TskData
 
 
 MODULE_NAME = "Optimized BLAKE3 Hasher"
-MODULE_VERSION = "4.2.1"
-MODULE_BUILD = "2026-10-08-deferred-artifact-publishing-r1"
+MODULE_VERSION = "5.0.0"
+MODULE_BUILD = "2026-11-25-chapter3-configurations-r1"
 KNOWN_EMPTY = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 MAX_REPORT_ROWS = 100000
 
@@ -96,6 +119,270 @@ _SMALL_FILE_LIMIT = _environment_integer(
     "BLAKE3_SMALL_FILE_LIMIT", 32 * 1024 * 1024
 )
 BATCH_MAX_BYTES = _SMALL_FILE_LIMIT
+# Baseline / non-adaptive transfer buffer (Tables 6 and 8).
+FIXED_TRANSFER_BYTES = 1024 * 1024
+
+# ── Thesis Table 8: configurations selectable per ingest job ─────────────────
+CONFIGURATIONS = {
+    "C0": {"label": "C0 Baseline BLAKE3", "profile": "blake3_baseline",
+           "adaptive_buffer": False, "batching": False, "algorithm": "BLAKE3"},
+    "C1": {"label": "C1 Buffer sizing only", "profile": "blake3_buffer_only",
+           "adaptive_buffer": True, "batching": False, "algorithm": "BLAKE3"},
+    "C2": {"label": "C2 Batching only", "profile": "blake3_baseline",
+           "adaptive_buffer": False, "batching": True, "algorithm": "BLAKE3"},
+    "C3": {"label": "C3 Threading only", "profile": "blake3_threads_only",
+           "adaptive_buffer": False, "batching": False, "algorithm": "BLAKE3"},
+    "C4": {"label": "C4 Full optimized implementation", "profile": "blake3_optimized",
+           "adaptive_buffer": True, "batching": True, "algorithm": "BLAKE3"},
+    "R1": {"label": "R1 MD5 (reference)", "profile": "md5",
+           "adaptive_buffer": False, "batching": False, "algorithm": "MD5"},
+    "R2": {"label": "R2 SHA-256 (reference)", "profile": "sha256",
+           "adaptive_buffer": False, "batching": False, "algorithm": "SHA-256"},
+}
+CONFIGURATION_ORDER = ("C0", "C1", "C2", "C3", "C4", "R1", "R2")
+DEFAULT_CONFIGURATION = "C4"
+# Verification passes run after hashing (Section 3.5), in this order.
+VERIFICATION_PROFILES = (
+    ("baseline_blake3", "blake3_baseline"),
+    ("md5", "md5"),
+    ("sha256", "sha256"),
+)
+DIGEST_LENGTHS = {
+    "blake3_baseline": 64, "blake3_buffer_only": 64, "blake3_threads_only": 64,
+    "blake3_optimized": 64, "md5": 32, "sha256": 64,
+}
+EMPTY_DIGESTS = {
+    "md5": "d41d8cd98f00b204e9800998ecf8427e",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+}
+SETTING_CONFIGURATION = "configuration"
+SETTING_TRIAL_BLOCK = "trial_block"
+SETTING_VERIFICATION = "verification_passes"
+TRIALS_CSV = os.environ.get("BLAKE3_TRIALS_CSV", "").strip()
+# One row per data source per ingest run; analyzed by
+# dev/benchmark_blake3.py autopsy <csv>.
+AUTOPSY_TRIAL_COLUMNS = (
+    "timestamp_utc", "case", "data_source", "data_source_size_bytes",
+    "configuration", "configuration_label", "trial_block", "ingest_threads",
+    "verification_passes", "files_hashed", "files_error", "files_skipped",
+    "readable_files", "completeness_percent", "digest_agreement_percent",
+    "bytes_hashed", "file_hashing_ms", "file_engine_ms", "throughput_mib_s",
+    "cpu_mean_percent", "cpu_samples", "peak_rss_mib",
+    "evidence_status", "evidence_ms", "evidence_throughput_mib_s",
+    "evidence_cpu_percent", "evidence_peak_rss_mib",
+    "physical_cores", "module_version", "engine_sha256",
+)
+
+
+def _transfer_buffer(size_bytes, adaptive=True):
+    """Bytes read from Autopsy per write to the engine (Table 7 or fixed 1 MiB)."""
+    return _adaptive_buffer(size_bytes) if adaptive else FIXED_TRANSFER_BYTES
+
+
+def _normalize_configuration(value):
+    code = str(value or "").strip().upper()[:2]
+    return code if code in CONFIGURATIONS else DEFAULT_CONFIGURATION
+
+
+def _job_settings(settings):
+    """Configuration, trial block and verification flag for one ingest job.
+
+    Read from the ingest settings panel, else from the BLAKE3_CONFIGURATION /
+    BLAKE3_TRIAL_BLOCK / BLAKE3_VERIFICATION_PASSES environment variables,
+    else the defaults (C4, 0 = not a measured trial, verification on).
+    """
+    def read(key, env_name, default):
+        value = None
+        try:
+            if settings is not None:
+                value = settings.getSetting(key)
+        except Exception:
+            value = None
+        if value in (None, ""):
+            value = os.environ.get(env_name, "")
+        return value if value not in (None, "") else default
+
+    code = _normalize_configuration(
+        read(SETTING_CONFIGURATION, "BLAKE3_CONFIGURATION", DEFAULT_CONFIGURATION))
+    try:
+        block = max(0, int(str(read(SETTING_TRIAL_BLOCK, "BLAKE3_TRIAL_BLOCK", "0"))))
+    except Exception:
+        block = 0
+    verify = str(read(SETTING_VERIFICATION, "BLAKE3_VERIFICATION_PASSES", "true")
+                 ).strip().lower() in ("1", "true", "yes", "on")
+    return {"configuration": code, "trial_block": block, "verification_passes": verify}
+
+
+def _number(value):
+    try:
+        if value in (None, "", "N/A"):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _run_cpu_mean(rows, cpu_key="cpu_utilization_percent", samples_key="cpu_samples"):
+    """Equation 5 over a whole run: the mean of every psutil sample of every request.
+
+    Each request reports the mean of its own samples and how many there were,
+    so the run-level mean is the sample-count-weighted mean of the requests.
+    """
+    total = 0.0
+    count = 0
+    for row in rows:
+        cpu = _number(row.get(cpu_key))
+        if cpu is None:
+            continue
+        samples = _number(row.get(samples_key))
+        samples = int(samples) if samples and samples > 0 else 1
+        total += cpu * samples
+        count += samples
+    return (total / count if count else None), count
+
+
+def _run_summaries(stats, readable_counter):
+    """Per-data-source run results for the trials CSV and the report.
+
+    ``readable_counter(data_source_id)`` returns the number of readable files
+    of that data source in the case database (Eq. 12 denominator).
+    """
+    rows = stats.get("rows", [])
+    code = _normalize_configuration(stats.get("configuration"))
+    blake3_run = CONFIGURATIONS[code]["algorithm"] == "BLAKE3"
+    sources = []
+    for row in rows:
+        if row.get("data_source_id") not in sources:
+            sources.append(row.get("data_source_id"))
+    summaries = []
+    for source_id in sources:
+        source_rows = [r for r in rows if r.get("data_source_id") == source_id]
+        files = [r for r in source_rows if r.get("source_kind") == "File"]
+        # Files hashed by the evaluated configuration (a digest was accepted).
+        hashed = [r for r in files if r.get("digest")]
+        evidence_rows = [r for r in source_rows if r.get("source_kind") == "Evidence source"]
+        evidence = evidence_rows[-1] if evidence_rows else {}
+        file_ms = sum([_number(r.get("end_to_end_elapsed_ms")) or 0.0 for r in hashed])
+        engine_ms = sum([_number(r.get("engine_elapsed_ms")) or 0.0 for r in hashed])
+        file_bytes = sum([int(r.get("size_bytes", 0) or 0) for r in hashed])
+        cpu_mean, cpu_samples = _run_cpu_mean(hashed)
+        rss = [v for v in [_number(r.get("peak_rss_mb")) for r in hashed] if v is not None]
+        verified = [r for r in hashed if r.get("baseline_blake3_status") == "ok"]
+        matching = [r for r in verified if r.get("baseline_blake3_matches") is True]
+        readable = None
+        try:
+            readable = readable_counter(source_id) if source_id is not None else None
+        except Exception:
+            readable = None
+        evidence_cpu, _evidence_samples = _run_cpu_mean([evidence]) if evidence else (None, 0)
+        summaries.append({
+            "data_source_id": source_id,
+            "data_source": (source_rows[0].get("data_source_name") or evidence.get("name")
+                            or str(source_id)),
+            "data_source_size_bytes": evidence.get("size_bytes", ""),
+            "configuration": code,
+            "configuration_label": CONFIGURATIONS[code]["label"],
+            "trial_block": stats.get("trial_block", 0),
+            "ingest_threads": stats.get("ingest_threads", ""),
+            "verification_passes": bool(stats.get("verification_passes")),
+            "files_hashed": len(hashed),
+            "files_error": len([r for r in files if r.get("status") == "error"]),
+            "files_skipped": len([r for r in files if r.get("status") == "skipped"]),
+            "readable_files": readable if readable is not None else "",
+            "completeness_percent": (100.0 * len(hashed) / readable) if readable else "",
+            "digest_agreement_percent": (
+                100.0 * len(matching) / len(verified) if (blake3_run and verified) else ""),
+            "bytes_hashed": file_bytes,
+            "file_hashing_ms": round(file_ms, 3),
+            "file_engine_ms": round(engine_ms, 3),
+            "throughput_mib_s": (
+                round((file_bytes / 1048576.0) / (file_ms / 1000.0), 3) if file_ms > 0 else ""),
+            "cpu_mean_percent": round(cpu_mean, 3) if cpu_mean is not None else "",
+            "cpu_samples": cpu_samples,
+            "peak_rss_mib": max(rss) if rss else "",
+            "evidence_status": evidence.get("status", "not run"),
+            "evidence_ms": (evidence.get("end_to_end_elapsed_ms", "")
+                            if evidence.get("status") == "ok" else ""),
+            "evidence_throughput_mib_s": (evidence.get("throughput_mb_s", "")
+                                          if evidence.get("status") == "ok" else ""),
+            "evidence_cpu_percent": round(evidence_cpu, 3) if evidence_cpu is not None else "",
+            "evidence_peak_rss_mib": evidence.get("peak_rss_mb", ""),
+            "physical_cores": max([int(_number(r.get("physical_cores")) or 0)
+                                   for r in source_rows] or [0]) or "",
+            "module_version": MODULE_VERSION,
+            "engine_sha256": stats.get("engine_sha256", ""),
+        })
+    return summaries
+
+
+def _csv_value(value):
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, unicode):  # noqa: F821 (Jython 2.7)
+            return value.encode("utf-8")
+    except NameError:
+        pass
+    return str(value)
+
+
+def _trials_csv_path():
+    if TRIALS_CSV:
+        return TRIALS_CSV
+    try:
+        home = str(System.getProperty("user.home"))
+    except Exception:
+        home = os.path.expanduser("~")
+    return os.path.join(home, "BLAKE3_Trials", "autopsy_trials.csv")
+
+
+def _append_trial_rows(summaries, path=None):
+    """Append one CSV row per summary; returns the file written."""
+    path = path or _trials_csv_path()
+    folder = os.path.dirname(path)
+    if folder and not os.path.isdir(folder):
+        os.makedirs(folder)
+    header = ",".join(AUTOPSY_TRIAL_COLUMNS)
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        handle = open(path, "r")
+        try:
+            existing = handle.readline().strip()
+        finally:
+            handle.close()
+        if existing.lstrip("\xef\xbb\xbf") != header:
+            # Columns changed between module versions: start a new file.
+            stem, extension = os.path.splitext(path)
+            path = stem + "_v" + MODULE_VERSION.replace(".", "_") + extension
+    new_file = not os.path.isfile(path) or os.path.getsize(path) == 0
+    handle = open(path, "ab")
+    try:
+        writer = csv.writer(handle)
+        if new_file:
+            writer.writerow(list(AUTOPSY_TRIAL_COLUMNS))
+        stamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        for summary in summaries:
+            values = dict(summary)
+            values.setdefault("timestamp_utc", stamp)
+            values.setdefault("case", "")
+            writer.writerow([_csv_value(values.get(column, "")) for column in AUTOPSY_TRIAL_COLUMNS])
+    finally:
+        handle.close()
+    return path
+
+
+def _readable_file_count(data_source_id):
+    """Files of the data source in the case database that the module can hash:
+    everything except directories and unallocated/unused space blocks."""
+    where = (
+        "data_source_obj_id = %d AND (meta_type IS NULL OR meta_type != %d) "
+        "AND type NOT IN (%d, %d)" % (
+            int(data_source_id),
+            TskData.TSK_FS_META_TYPE_ENUM.TSK_FS_META_TYPE_DIR.getValue(),
+            TskData.TSK_DB_FILES_TYPE_ENUM.UNALLOC_BLOCKS.getFileType(),
+            TskData.TSK_DB_FILES_TYPE_ENUM.UNUSED_BLOCKS.getFileType(),
+        )
+    )
+    return int(Case.getCurrentCase().getSleuthkitCase().countFilesWhere(where))
 
 _JOBS = {}
 _JOBS_LOCK = threading.RLock()
@@ -433,9 +720,10 @@ class _Sidecar(object):
             context=None,
             progress=None,
             profile="blake3_optimized",
-            _recover=True):
+            _recover=True,
+            adaptive_transfer=True):
         size_bytes = int(size_bytes)
-        chunk_size = _adaptive_buffer(size_bytes)
+        chunk_size = _transfer_buffer(size_bytes, adaptive_transfer)
         buffer = zeros(chunk_size, 'b')
         request = json.dumps({
             "size": size_bytes,
@@ -540,7 +828,28 @@ class _Sidecar(object):
             return False, "sidecar restart after batch probe failed: " + str(exc)
         return True, "batch protocol probe passed"
 
-    def hash_batch(self, items, context=None, _recover=True):
+    def profiles_self_test(self, profiles):
+        """Hash an empty input with every engine profile the job will use.
+
+        Confirms the packaged engine supports the selected configuration and
+        the verification passes before any evidence is read.
+        """
+        checked = []
+        for profile in profiles:
+            if profile in checked:
+                continue
+            count, result, error = self.hash_content(
+                _EmptyContent(), 0, profile=profile, _recover=False)
+            expected = EMPTY_DIGESTS.get(profile, KNOWN_EMPTY)
+            digest = str(result.get("digest", "")).lower() if result else ""
+            if error or result is None or result.get("status") != "ok" or digest != expected:
+                return False, "profile %s: %s" % (
+                    profile, error or (result.get("message") if result else "no result")
+                    or "empty-input digest mismatch")
+            checked.append(profile)
+        return True, "engine profiles verified: " + ", ".join(checked)
+
+    def hash_batch(self, items, context=None, _recover=True, adaptive_transfer=True):
         """Hash multiple files in a single IPC round-trip.
 
         Parameters
@@ -585,7 +894,7 @@ class _Sidecar(object):
         desync = False
         for (content, size_bytes, profile) in items:
             size_bytes = int(size_bytes)
-            chunk_size = _adaptive_buffer(size_bytes)
+            chunk_size = _transfer_buffer(size_bytes, adaptive_transfer)
             buffer = zeros(chunk_size, 'b')
             offset = 0
             item_error = None
@@ -693,10 +1002,9 @@ class _EmptyContent(object):
 
 
 def _baseline_hashes(file_obj):
-    result = {"md5": "", "sha1": "", "sha256": ""}
+    result = {"md5": "", "sha256": ""}
     methods = {
         "md5": "getMd5Hash",
-        "sha1": "getSha1Hash",
         "sha256": "getSha256Hash",
     }
     for name, method_name in methods.items():
@@ -712,7 +1020,7 @@ def _baseline_hashes(file_obj):
 def _attach_autopsy_hash_checks(row, file_obj):
     """Record digest agreement with hashes already stored by Autopsy."""
     autopsy_hashes = _baseline_hashes(file_obj)
-    for name in ("md5", "sha1", "sha256"):
+    for name in ("md5", "sha256"):
         autopsy_digest = str(autopsy_hashes.get(name, "") or "").lower()
         measured_digest = str(row.get(name, "") or "").lower()
         row["autopsy_" + name] = autopsy_digest
@@ -861,7 +1169,8 @@ def _post_artifact(blackboard, content, row):
         ("BLAKE3_V4_CPU", "Engine CPU Utilization", _format_percent(cpu_value) if str(cpu_value) not in ("N/A", "", "None") else "N/A"),
         ("BLAKE3_V4_RSS", "Engine Peak Memory", _format_mib(rss_value) if str(rss_value) not in ("N/A", "", "None") else "N/A"),
         ("BLAKE3_V4_SIMD", "SIMD Dispatch", row.get("simd_tier", "")),
-        ("BLAKE3_V4_THREADS", "Maximum Native Cores", row.get("threads_used", "")),
+        ("BLAKE3_V4_THREADS", "Native BLAKE3 Threads", row.get("threads_used", "")),
+        ("BLAKE3_V5_CONFIG", "Configuration", row.get("configuration_label", "")),
         ("BLAKE3_V4_IO", "Engine I/O Strategy", row.get("io_strategy", "streamed IPC")),
         ("BLAKE3_V4_CATEGORY", "Evidence Category", row.get("category", "Other")),
     ]
@@ -934,7 +1243,8 @@ def _hash_one(
         context,
         source_kind,
         progress=None,
-        profile="blake3_optimized"):
+        profile="blake3_optimized",
+        adaptive_transfer=True):
     started_ns = System.nanoTime()
     actual, result, bridge_error = sidecar.hash_content(
         content,
@@ -942,6 +1252,7 @@ def _hash_one(
         context=context,
         progress=progress,
         profile=profile,
+        adaptive_transfer=adaptive_transfer,
     )
     elapsed_ms = max(0.0, (System.nanoTime() - started_ns) / 1000000.0)
     name = _safe_name(content)
@@ -955,6 +1266,7 @@ def _hash_one(
         "throughput_mb_s": round(
             (float(size_bytes) / (1024.0 * 1024.0)) / (elapsed_ms / 1000.0), 3
         ) if elapsed_ms > 0.0 else 0.0,
+        "transfer_buffer": _transfer_buffer(size_bytes, adaptive_transfer),
     }
     try:
         base["object_id"] = int(content.getId())
@@ -982,40 +1294,65 @@ def _hash_one(
         })
         return base
     digest = str(result.get("digest", ""))
-    expected_lengths = {
-        "md5": 32,
-        "sha1": 40,
-        "sha256": 64,
-        "blake3_baseline": 64,
-        "blake3_optimized": 64,
-    }
     if (
         actual != int(size_bytes)
-        or not _valid_digest(digest, expected_lengths.get(profile, 64))
+        or not _valid_digest(digest, DIGEST_LENGTHS.get(profile, 64))
     ):
         base.update({"status": "error", "error": "byte-count/digest validation failed", "digest": ""})
         return base
-    base.update({
-        "status": "ok",
-        "error": "",
-        "digest": digest.lower(),
+    base.update(_engine_fields(result, profile))
+    base.update({"status": "ok", "error": "", "digest": digest.lower()})
+    return base
+
+
+def _engine_fields(result, profile):
+    """Metrics reported by the engine for one request (Table 9)."""
+    return {
         "engine_elapsed_ms": result.get(
             "elapsed_ms", float(result.get("elapsed_s", 0.0)) * 1000.0
         ),
         "engine_throughput_mb_s": result.get("throughput_mb_s", ""),
         "cpu_utilization_percent": result.get("cpu_utilization_percent", "N/A"),
+        "cpu_samples": result.get("cpu_samples", ""),
         "process_cpu_percent": result.get("process_cpu_percent", "N/A"),
         "peak_rss_mb": result.get("peak_rss_mb", "N/A"),
         "simd_tier": result.get("simd_tier", "native runtime dispatch"),
         "threads_used": result.get("threads_used", ""),
         "io_strategy": result.get("io_strategy", "Autopsy streamed IPC"),
-        "chunk_size": result.get("chunk_size", _adaptive_buffer(size_bytes)),
-        "backend": result.get("backend", "packaged native sidecar"),
-        "backend_version": result.get("backend_version", "legacy package metadata unavailable"),
+        "chunk_size": result.get("chunk_size", ""),
+        "backend": result.get("backend", "packaged native engine"),
+        "backend_version": result.get("backend_version", ""),
         "algorithm": result.get("algorithm", "BLAKE3"),
         "profile": result.get("profile", profile),
-    })
-    return base
+        "physical_cores": result.get("physical_cores", ""),
+    }
+
+
+def _verification_pass(sidecar, content, size_bytes, context, prefix, profile, progress=None):
+    """One independent verification request (fixed 1 MiB transfer, no batching)."""
+    row = _hash_one(
+        sidecar,
+        content,
+        size_bytes,
+        context,
+        "Verification",
+        progress=progress,
+        profile=profile,
+        adaptive_transfer=False,
+    )
+    return {
+        prefix + "_status": row.get("status", "error"),
+        prefix + "_error": row.get("error", ""),
+        prefix + "_digest": row.get("digest", ""),
+        prefix + "_elapsed_ms": row.get("end_to_end_elapsed_ms", ""),
+        prefix + "_throughput_mb_s": row.get("throughput_mb_s", ""),
+        prefix + "_cpu_utilization_percent": row.get("cpu_utilization_percent", "N/A"),
+        prefix + "_cpu_samples": row.get("cpu_samples", ""),
+        prefix + "_peak_rss_mb": row.get("peak_rss_mb", "N/A"),
+        prefix + "_bytes_read": row.get("bytes_read", 0),
+        prefix + "_backend": row.get("backend", ""),
+        prefix + "_profile": row.get("profile", profile),
+    }
 
 
 def _comparison_hashes(
@@ -1023,48 +1360,102 @@ def _comparison_hashes(
         content,
         size_bytes,
         context,
-        optimized_digest,
         progress_factory=None):
-    """Run independent full-pass thesis comparison profiles."""
+    """Baseline BLAKE3, MD5 and SHA-256 verification passes for one object."""
     comparisons = {}
-    profiles = (
-        ("baseline_blake3", "blake3_baseline"),
-        ("md5", "md5"),
-        ("sha1", "sha1"),
-        ("sha256", "sha256"),
-    )
-    for index, (prefix, profile) in enumerate(profiles):
-        progress = progress_factory(index, len(profiles)) if progress_factory else None
-        row = _hash_one(
-            sidecar,
-            content,
-            size_bytes,
-            context,
-            "Comparison",
-            progress=progress,
-            profile=profile,
-        )
-        comparisons[prefix + "_status"] = row.get("status", "error")
-        comparisons[prefix + "_error"] = row.get("error", "")
-        comparisons[prefix + "_digest"] = row.get("digest", "")
-        comparisons[prefix + "_elapsed_ms"] = row.get("end_to_end_elapsed_ms", "")
-        comparisons[prefix + "_throughput_mb_s"] = row.get("throughput_mb_s", "")
-        comparisons[prefix + "_cpu_utilization_percent"] = row.get(
-            "cpu_utilization_percent", "N/A"
-        )
-        comparisons[prefix + "_peak_rss_mb"] = row.get("peak_rss_mb", "N/A")
-        comparisons[prefix + "_bytes_read"] = row.get("bytes_read", 0)
-        comparisons[prefix + "_backend"] = row.get("backend", "")
-        comparisons[prefix + "_profile"] = row.get("profile", profile)
-        if row.get("status") != "ok" and row.get("error") == "CANCELLED":
+    for index, (prefix, profile) in enumerate(VERIFICATION_PROFILES):
+        progress = (progress_factory(index, len(VERIFICATION_PROFILES))
+                    if progress_factory else None)
+        comparisons.update(_verification_pass(
+            sidecar, content, size_bytes, context, prefix, profile, progress))
+        if comparisons.get(prefix + "_error") == "CANCELLED":
             break
-    baseline_digest = str(comparisons.get("baseline_blake3_digest", ""))
-    comparisons["baseline_blake3_matches"] = bool(
-        baseline_digest
-        and optimized_digest
-        and baseline_digest.lower() == str(optimized_digest).lower()
-    )
     return comparisons
+
+
+def _apply_verification(row, code):
+    """Compare the evaluated digest with the verification passes (Eq. 11 input).
+
+    BLAKE3 configurations (C0-C4) must equal the independent baseline BLAKE3
+    digest. R1/R2 must equal their own algorithm's verification pass; their
+    digests are not compared with BLAKE3.
+    """
+    row["md5"] = row.get("md5_digest", "")
+    row["sha256"] = row.get("sha256_digest", "")
+    primary = str(row.get("digest", "")).lower()
+    algorithm = CONFIGURATIONS[code]["algorithm"]
+    if algorithm == "BLAKE3":
+        baseline = str(row.get("baseline_blake3_digest", "")).lower()
+        row["baseline_blake3_matches"] = bool(baseline and primary and baseline == primary)
+        if (
+            row.get("status") == "ok"
+            and row.get("baseline_blake3_status") == "ok"
+            and not row["baseline_blake3_matches"]
+        ):
+            row["status"] = "error"
+            row["error"] = "BASELINE_BLAKE3_DIGEST_MISMATCH"
+    else:
+        prefix = "md5" if algorithm == "MD5" else "sha256"
+        reference = str(row.get(prefix + "_digest", "")).lower()
+        row["baseline_blake3_matches"] = None
+        row["primary_matches_verification"] = bool(reference and primary and reference == primary)
+        if (
+            row.get("status") == "ok"
+            and row.get(prefix + "_status") == "ok"
+            and not row["primary_matches_verification"]
+        ):
+            row["status"] = "error"
+            row["error"] = "%s_VERIFICATION_DIGEST_MISMATCH" % algorithm.replace("-", "")
+    return row
+
+
+def _record_for(module, row):
+    """Record a row tagged with the module's data source and configuration."""
+    row["data_source_id"] = getattr(module, "data_source_id", None)
+    row["data_source_name"] = getattr(module, "data_source_name", "")
+    row.setdefault("configuration", getattr(module, "code", DEFAULT_CONFIGURATION))
+    _record(module.job_id, row)
+
+
+class BLAKE3SettingsPanel(IngestModuleIngestJobSettingsPanel):
+    """Ingest job settings: configuration (Table 8), trial block, verification passes."""
+
+    def __init__(self, settings):
+        self.local_settings = settings
+        self.initComponents()
+        self.customizeComponents()
+
+    def initComponents(self):
+        self.setLayout(BoxLayout(self, BoxLayout.Y_AXIS))
+        self.add(JLabel("Configuration (thesis Table 8):"))
+        labels = Vector()
+        for code in CONFIGURATION_ORDER:
+            labels.add(CONFIGURATIONS[code]["label"])
+        self.configuration_box = JComboBox(labels)
+        self.add(self.configuration_box)
+        self.add(JLabel(" "))
+        self.add(JLabel("Trial block (1-30 for measured trials; 0 = not a trial):"))
+        self.trial_spinner = JSpinner(SpinnerNumberModel(0, 0, 9999, 1))
+        self.add(self.trial_spinner)
+        self.add(JLabel(" "))
+        self.verification_box = JCheckBox(
+            "After hashing, run the verification passes (baseline BLAKE3, MD5, SHA-256)")
+        self.add(self.verification_box)
+
+    def customizeComponents(self):
+        values = _job_settings(self.local_settings)
+        self.configuration_box.setSelectedIndex(
+            list(CONFIGURATION_ORDER).index(values["configuration"]))
+        self.trial_spinner.setValue(values["trial_block"])
+        self.verification_box.setSelected(bool(values["verification_passes"]))
+
+    def getSettings(self):
+        code = CONFIGURATION_ORDER[max(0, self.configuration_box.getSelectedIndex())]
+        self.local_settings.setSetting(SETTING_CONFIGURATION, code)
+        self.local_settings.setSetting(SETTING_TRIAL_BLOCK, str(int(self.trial_spinner.getValue())))
+        self.local_settings.setSetting(
+            SETTING_VERIFICATION, "true" if self.verification_box.isSelected() else "false")
+        return self.local_settings
 
 
 class BLAKE3IngestModuleFactory(IngestModuleFactoryAdapter):
@@ -1073,27 +1464,52 @@ class BLAKE3IngestModuleFactory(IngestModuleFactoryAdapter):
 
     def getModuleDescription(self):
         return (
-            "Standards-compliant native BLAKE3 hashing with exact byte-count "
-            "validation, adaptive Autopsy streaming, SIMD runtime dispatch, "
-            "independent Baseline BLAKE3/MD5/SHA-1/SHA-256 comparison passes, "
-            "precision metrics, and an automatic HTML/JSON audit report. "
+            "BLAKE3 hashing of every readable file and the complete evidence source "
+            "under a selectable configuration (C0-C4, R1 MD5, R2 SHA-256; thesis "
+            "Table 8), with exact byte-count validation, optional baseline "
+            "BLAKE3/MD5/SHA-256 verification passes, and an HTML/JSON report. "
             "Build: " + MODULE_BUILD
         )
 
     def getModuleVersionNumber(self):
         return MODULE_VERSION
 
+    def getDefaultIngestJobSettings(self):
+        settings = GenericIngestModuleJobSettings()
+        defaults = _job_settings(None)
+        settings.setSetting(SETTING_CONFIGURATION, defaults["configuration"])
+        settings.setSetting(SETTING_TRIAL_BLOCK, str(defaults["trial_block"]))
+        settings.setSetting(
+            SETTING_VERIFICATION, "true" if defaults["verification_passes"] else "false")
+        return settings
+
+    def hasIngestJobSettingsPanel(self):
+        return True
+
+    def getIngestJobSettingsPanel(self, settings):
+        if not isinstance(settings, GenericIngestModuleJobSettings):
+            settings = self.getDefaultIngestJobSettings()
+        return BLAKE3SettingsPanel(settings)
+
     def isFileIngestModuleFactory(self):
         return True
 
     def createFileIngestModule(self, ingestOptions):
-        return BLAKE3FileIngestModule()
+        return BLAKE3FileIngestModule(ingestOptions)
 
     def isDataSourceIngestModuleFactory(self):
         return True
 
     def createDataSourceIngestModule(self, ingestOptions):
-        return BLAKE3DataSourceIngestModule()
+        return BLAKE3DataSourceIngestModule(ingestOptions)
+
+
+def _ingest_thread_count():
+    try:
+        from org.sleuthkit.autopsy.core import UserPreferences
+        return int(UserPreferences.numberOfFileIngestThreads())
+    except Exception:
+        return ""
 
 
 def _startup_module(module, context):
@@ -1103,6 +1519,14 @@ def _startup_module(module, context):
     current_case = Case.getCurrentCase()
     module.blackboard = current_case.getSleuthkitCase().getBlackboard()
     module.data_source_id = context.getDataSource().getId()
+    try:
+        module.data_source_name = str(context.getDataSource().getName())
+    except Exception:
+        module.data_source_name = ""
+    job_settings = _job_settings(getattr(module, "settings", None))
+    module.code = job_settings["configuration"]
+    module.config = CONFIGURATIONS[module.code]
+    module.verification = job_settings["verification_passes"]
     # Register before any file is processed, including file-only ingest jobs.
     _register_report_listener(module.job_id, context.getDataSource())
     module.engine_path = _engine_path()
@@ -1117,11 +1541,22 @@ def _startup_module(module, context):
     if not batch_passed:
         module.sidecar.close()
         raise IngestModule.IngestModuleException(
-            "BLAKE3 sidecar does not support the batch IPC protocol used by "
+            "The BLAKE3 engine does not support the batch protocol used by "
             "this ingest module (" + batch_message + "). Rebuild "
             "optimized_blake3_hasher.exe from the current optimized_blake3.py "
-            "via build_sidecar.ps1 and replace it next to "
+            "with build_sidecar.ps1 and replace it next to "
             "blake3_ingest_module.py, then re-run ingest."
+        )
+    profiles = [module.config["profile"]]
+    if module.verification:
+        profiles += [profile for _prefix, profile in VERIFICATION_PROFILES]
+    profiles_passed, profiles_message = module.sidecar.profiles_self_test(profiles)
+    if not profiles_passed:
+        module.sidecar.close()
+        raise IngestModule.IngestModuleException(
+            "The BLAKE3 engine does not support the profiles required by "
+            + module.config["label"] + " (" + profiles_message + "). Rebuild "
+            "optimized_blake3_hasher.exe from the current optimized_blake3.py."
         )
     with _JOBS_LOCK:
         stats = _job(module.job_id)
@@ -1129,6 +1564,13 @@ def _startup_module(module, context):
         stats["engine_sha256"] = _sha256_file(module.engine_path)
         stats["self_test"] = "PASSED: " + message
         stats["batch_self_test"] = "PASSED: " + batch_message
+        stats["profiles_self_test"] = "PASSED: " + profiles_message
+        stats["configuration"] = module.code
+        stats["configuration_label"] = module.config["label"]
+        stats["engine_profile"] = module.config["profile"]
+        stats["trial_block"] = job_settings["trial_block"]
+        stats["verification_passes"] = bool(module.verification)
+        stats["ingest_threads"] = _ingest_thread_count()
     _instance_started(module.job_id)
 
 
@@ -1140,17 +1582,21 @@ def _shutdown_module(module):
 
 
 class BLAKE3FileIngestModule(FileIngestModule):
-    def __init__(self):
+    def __init__(self, settings=None):
+        self.settings = settings
         self.context = None
         self.sidecar = None
         self.job_id = None
         # Per-instance pending-batch queue (each Autopsy ingest thread gets its
         # own module instance, so no cross-thread sharing occurs here).
         self._batch_queue = []
+        # Rows waiting for the verification passes that run after hashing.
+        self._deferred = []
 
     def startUp(self, context):
         _startup_module(self, context)
         self._batch_queue = []
+        self._deferred = []
 
     def process(self, file_obj):
         try:
@@ -1174,7 +1620,7 @@ class BLAKE3FileIngestModule(FileIngestModule):
                     "rather than a real, recovered file."
                 )
             if skip_reason is not None:
-                _record(self.job_id, {
+                _record_for(self, {
                     "status": "skipped",
                     "name": _safe_name(file_obj),
                     "source_kind": "File",
@@ -1186,16 +1632,19 @@ class BLAKE3FileIngestModule(FileIngestModule):
 
             size_bytes = int(file_obj.getSize())
 
-            # Large files bypass the batch queue: they benefit from native tree
-            # parallelism inside the sidecar, which works best one file at a time.
-            if size_bytes >= BATCH_MAX_BYTES:
+            # Files of 32 MiB and above are sent individually so the engine can
+            # apply multithreaded hashing; without batching (C0, C1, C3, R1,
+            # R2) every file is one request.
+            if not self.config["batching"] or size_bytes >= BATCH_MAX_BYTES:
                 row = _hash_one(
-                    self.sidecar, file_obj, size_bytes, self.context, "File"
+                    self.sidecar, file_obj, size_bytes, self.context, "File",
+                    profile=self.config["profile"],
+                    adaptive_transfer=self.config["adaptive_buffer"],
                 )
                 self._post_file_row(row, file_obj)
                 return IngestModule.ProcessResult.OK
 
-            # Accumulate small files into the batch queue.
+            # C2/C4: accumulate files below 32 MiB into the batch queue.
             self._batch_queue.append(file_obj)
             if len(self._batch_queue) >= BATCH_WINDOW:
                 pending = self._batch_queue
@@ -1203,7 +1652,7 @@ class BLAKE3FileIngestModule(FileIngestModule):
                 self._flush_batch(pending)
 
         except Exception as exc:
-            _record(self.job_id, {
+            _record_for(self, {
                 "status": "error",
                 "name": _safe_name(file_obj),
                 "source_kind": "File",
@@ -1214,32 +1663,24 @@ class BLAKE3FileIngestModule(FileIngestModule):
         return IngestModule.ProcessResult.OK
 
     def _flush_batch(self, pending):
-        """Send a window of small files to the sidecar in one IPC burst."""
+        """Send a group of up to BATCH_WINDOW small files in one request."""
+        profile = self.config["profile"]
+        adaptive = self.config["adaptive_buffer"]
         items = [
-            (f, int(f.getSize()), "blake3_optimized")
+            (f, int(f.getSize()), profile)
             for f in pending
         ]
         batch_started_ns = System.nanoTime()
-        batch_results = self.sidecar.hash_batch(items, context=self.context)
+        batch_results = self.sidecar.hash_batch(
+            items, context=self.context, adaptive_transfer=adaptive)
         batch_elapsed_ms = max(
             0.0, (System.nanoTime() - batch_started_ns) / 1000000.0
         )
 
-        # There is only one measured round trip for the whole batch, not one
-        # per file. Every total in _generate_report (the Executive Summary
-        # "Hashing Speed" figure, every row of the Speed Comparison table, and
-        # stats["elapsed_ms"] in _record) sums end_to_end_elapsed_ms across
-        # every "ok" file and assumes that sum is meaningful. Leaving it at a
-        # flat 0.0 per file didn't raise anything by itself -- every division
-        # against it is already guarded -- but it silently broke that
-        # invariant: files still added their full size_bytes to every total
-        # while contributing 0 ms, so aggregate throughput/timing figures
-        # became wrong (usually driven toward 0.00 MiB/s, or wildly inflated
-        # if only a few non-batched files carried the whole job's timing) as
-        # soon as batching handled any meaningful share of a job. Instead,
-        # distribute the one measured round trip across the batch's files
-        # proportional to bytes actually transferred, so each row -- and every
-        # total derived from it -- carries a real, additive timing figure.
+        # One round trip is measured for the whole batch. It is divided among
+        # the batch's files in proportion to their sizes in bytes (Section 3.5),
+        # so per-file times are estimates marked BATCH-EST while the batch and
+        # job totals remain exact.
         total_actual_bytes = sum(
             max(0, int(batch_item[0])) for batch_item in batch_results
         )
@@ -1268,11 +1709,9 @@ class BLAKE3FileIngestModule(FileIngestModule):
                 "category": _category(name),
                 "size_bytes": size_bytes,
                 "bytes_read": int(actual),
-                # Distributed from one measured batch round trip, not
-                # individually timed -- see batch_elapsed_ms/batch_item_count
-                # on this row for the true measurement it was derived from.
                 "end_to_end_elapsed_ms": round(item_elapsed_ms, 3),
                 "throughput_mb_s": round(item_throughput, 3),
+                "transfer_buffer": _transfer_buffer(size_bytes, adaptive),
                 "batch_mode": True,
                 "batch_elapsed_ms": round(batch_elapsed_ms, 3),
                 "batch_item_count": len(batch_results),
@@ -1295,7 +1734,7 @@ class BLAKE3FileIngestModule(FileIngestModule):
                     })
                 else:
                     base.update({"status": "error", "error": bridge_error, "digest": ""})
-                _record(self.job_id, base)
+                _record_for(self, base)
                 continue
 
             if engine_result is None or engine_result.get("status") != "ok":
@@ -1305,52 +1744,32 @@ class BLAKE3FileIngestModule(FileIngestModule):
                     if engine_result else "engine error",
                     "digest": "",
                 })
-                _record(self.job_id, base)
+                _record_for(self, base)
                 continue
 
             digest = str(engine_result.get("digest", ""))
-            if actual != size_bytes or not _valid_digest(digest, 64):
+            if actual != size_bytes or not _valid_digest(digest, DIGEST_LENGTHS.get(profile, 64)):
                 base.update({
                     "status": "error",
                     "error": "byte-count/digest validation failed",
                     "digest": "",
                 })
-                _record(self.job_id, base)
+                _record_for(self, base)
                 continue
 
-            base.update({
-                "status": "ok",
-                "error": "",
-                "digest": digest.lower(),
-                "engine_elapsed_ms": engine_result.get("elapsed_ms", 0.0),
-                "engine_throughput_mb_s": engine_result.get("throughput_mb_s", ""),
-                "cpu_utilization_percent": engine_result.get("cpu_utilization_percent", "N/A"),
-                "process_cpu_percent": engine_result.get("process_cpu_percent", "N/A"),
-                "peak_rss_mb": engine_result.get("peak_rss_mb", "N/A"),
-                "simd_tier": engine_result.get("simd_tier", "native runtime dispatch"),
-                "threads_used": engine_result.get("threads_used", ""),
-                "io_strategy": engine_result.get("io_strategy", "Autopsy batched IPC"),
-                "chunk_size": engine_result.get("chunk_size", _adaptive_buffer(size_bytes)),
-                "backend": engine_result.get("backend", "packaged native sidecar"),
-                "backend_version": engine_result.get("backend_version", ""),
-                "algorithm": engine_result.get("algorithm", "BLAKE3"),
-                "profile": engine_result.get("profile", "blake3_optimized"),
-            })
+            base.update(_engine_fields(engine_result, profile))
+            base.update({"status": "ok", "error": "", "digest": digest.lower()})
             self._post_file_row(base, file_obj)
 
     def _post_file_row(self, row, file_obj):
-        """Run comparison hashes, attach Autopsy checks, post artifact, record row.
-
-        This is the original post-hashing logic extracted into a helper so both
-        the single-file path and the batch-flush path share the same code.
-        """
-        if row["status"] == "ok":
+        """Defer a hashed file to the verification passes, or record it now."""
+        row["configuration"] = self.code
+        if row["status"] == "ok" and self.verification:
             integrity_sample, performance_sample = _claim_comparison_sample(
                 self.job_id,
                 row.get("category", "Other"),
                 row.get("size_bytes", 0),
             )
-            run_comparison = integrity_sample or performance_sample
             row["comparison_integrity_sample"] = bool(integrity_sample)
             row["comparison_performance_sample"] = bool(performance_sample)
             row["comparison_scope"] = (
@@ -1362,30 +1781,23 @@ class BLAKE3FileIngestModule(FileIngestModule):
                     )
                 )
             )
-            if run_comparison:
-                comparison = _comparison_hashes(
-                    self.sidecar,
-                    file_obj,
-                    int(file_obj.getSize()),
-                    self.context,
-                    row.get("digest", ""),
-                )
-                row.update(comparison)
-                row["md5"] = comparison.get("md5_digest", "")
-                row["sha1"] = comparison.get("sha1_digest", "")
-                row["sha256"] = comparison.get("sha256_digest", "")
-            _attach_autopsy_hash_checks(row, file_obj)
-            if (
-                run_comparison
-                and row.get("baseline_blake3_status") == "ok"
-                and not row.get("baseline_blake3_matches")
-            ):
-                row["status"] = "error"
-                row["error"] = "BASELINE_BLAKE3_DIGEST_MISMATCH"
+            if integrity_sample or performance_sample:
+                self._deferred.append((row, file_obj))
+                return
+        elif row["status"] == "ok":
+            row["comparison_scope"] = "verification passes disabled"
+        self._finish_file_row(row, file_obj)
 
-        _record(self.job_id, row)
+    def _finish_file_row(self, row, file_obj):
+        if row.get("digest"):
+            _attach_autopsy_hash_checks(row, file_obj)
+        _record_for(self, row)
         if row["status"] == "ok":
-            if POST_ALL_FILE_ARTIFACTS or row.get("comparison_scope") != "optimized-only":
+            # Artifacts are BLAKE3 results; R1/R2 reference runs post none.
+            if self.config["algorithm"] == "BLAKE3" and (
+                POST_ALL_FILE_ARTIFACTS or row.get("comparison_scope") != "optimized-only"
+            ):
+                row["configuration_label"] = self.config["label"]
                 _queue_artifact(
                     self.job_id, self.data_source_id, self.blackboard, file_obj, row
                 )
@@ -1396,8 +1808,33 @@ class BLAKE3FileIngestModule(FileIngestModule):
                 "BLAKE3 failed for %s: %s" % (row["name"], row.get("error", "")),
             ))
 
+    def _run_verification_passes(self):
+        """Separate full passes after hashing: baseline BLAKE3, then MD5, then SHA-256."""
+        try:
+            for prefix, profile in VERIFICATION_PROFILES:
+                for row, file_obj in self._deferred:
+                    try:
+                        if self.context is not None and self.context.isJobCancelled():
+                            row.setdefault("verification_note", "verification cancelled")
+                            continue
+                    except Exception:
+                        pass
+                    row.update(_verification_pass(
+                        self.sidecar, file_obj, int(file_obj.getSize()),
+                        self.context, prefix, profile))
+            for row, _file_obj in self._deferred:
+                _apply_verification(row, self.code)
+        except Exception as exc:
+            for row, _file_obj in self._deferred:
+                row.setdefault("verification_note", "verification failed: " + str(exc))
+        finally:
+            deferred, self._deferred = self._deferred, []
+            for row, file_obj in deferred:
+                self._finish_file_row(row, file_obj)
+
     def shutDown(self):
-        # Flush any partial batch before the sidecar process is closed.
+        # Flush any partial batch before the verification passes and before
+        # the engine process is closed.
         if self._batch_queue:
             remaining = self._batch_queue
             self._batch_queue = []
@@ -1405,11 +1842,14 @@ class BLAKE3FileIngestModule(FileIngestModule):
                 self._flush_batch(remaining)
             except Exception:
                 pass
+        if self._deferred:
+            self._run_verification_passes()
         _shutdown_module(self)
 
 
 class BLAKE3DataSourceIngestModule(DataSourceIngestModule):
-    def __init__(self):
+    def __init__(self, settings=None):
+        self.settings = settings
         self.context = None
         self.sidecar = None
         self.job_id = None
@@ -1432,7 +1872,8 @@ class BLAKE3DataSourceIngestModule(DataSourceIngestModule):
             except Exception:
                 pass
 
-            phase_count = 6 if EVIDENCE_CACHE_WARMUP else 5
+            verification_count = len(VERIFICATION_PROFILES) if self.verification else 0
+            phase_count = (2 if EVIDENCE_CACHE_WARMUP else 1) + verification_count
 
             def phase_progress(phase_index):
                 def progress(done, total):
@@ -1448,9 +1889,12 @@ class BLAKE3DataSourceIngestModule(DataSourceIngestModule):
                             pass
                 return progress
 
+            profile = self.config["profile"]
+            adaptive = self.config["adaptive_buffer"]
             measured_phase = 0
             warmup = None
             if EVIDENCE_CACHE_WARMUP:
+                # Untimed pass that loads the image into the file cache.
                 warmup = _hash_one(
                     self.sidecar,
                     data_source,
@@ -1458,6 +1902,8 @@ class BLAKE3DataSourceIngestModule(DataSourceIngestModule):
                     self.context,
                     "Evidence source warm-up",
                     phase_progress(0),
+                    profile=profile,
+                    adaptive_transfer=adaptive,
                 )
                 measured_phase = 1
             if warmup is not None and warmup.get("status") != "ok":
@@ -1474,6 +1920,8 @@ class BLAKE3DataSourceIngestModule(DataSourceIngestModule):
                     self.context,
                     "Evidence source",
                     phase_progress(measured_phase),
+                    profile=profile,
+                    adaptive_transfer=adaptive,
                 )
                 if warmup is not None:
                     row["cache_control"] = "one complete unmeasured warm-up pass"
@@ -1486,35 +1934,28 @@ class BLAKE3DataSourceIngestModule(DataSourceIngestModule):
                     )
                     if row.get("status") == "ok" and not row["warmup_digest_matches"]:
                         row["status"] = "error"
-                        row["error"] = "WARMUP_BLAKE3_DIGEST_MISMATCH"
-            if row["status"] == "ok":
+                        row["error"] = "WARMUP_DIGEST_MISMATCH"
+            row["configuration"] = self.code
+            if row["status"] == "ok" and self.verification:
                 comparison = _comparison_hashes(
                     self.sidecar,
                     data_source,
                     int(data_source.getSize()),
                     self.context,
-                    row.get("digest", ""),
                     progress_factory=lambda index, total: phase_progress(
                         index + measured_phase + 1
                     ),
                 )
                 row.update(comparison)
-                row["md5"] = comparison.get("md5_digest", "")
-                row["sha1"] = comparison.get("sha1_digest", "")
-                row["sha256"] = comparison.get("sha256_digest", "")
-                if (
-                    comparison.get("baseline_blake3_status") == "ok"
-                    and not comparison.get("baseline_blake3_matches")
-                ):
-                    row["status"] = "error"
-                    row["error"] = "BASELINE_BLAKE3_DIGEST_MISMATCH"
-            _record(self.job_id, row)
-            if row["status"] == "ok":
+                _apply_verification(row, self.code)
+            _record_for(self, row)
+            if row["status"] == "ok" and self.config["algorithm"] == "BLAKE3":
+                row["configuration_label"] = self.config["label"]
                 _queue_artifact(
                     self.job_id, self.data_source_id, self.blackboard, data_source, row
                 )
         except Exception as exc:
-            _record(self.job_id, {
+            _record_for(self, {
                 "status": "error",
                 "name": _safe_name(data_source),
                 "source_kind": "Evidence source",
@@ -1567,7 +2008,7 @@ def _generate_report_minimal(job_id):
                 "<tr><td>%s</td><td>%s</td><td>%s</td><td class='num'>%s</td>"
                 "<td class='digest'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
                 "<td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
-                "<td class='digest'>%s</td><td class='digest'>%s</td><td class='digest'>%s</td>"
+                "<td class='digest'>%s</td><td class='digest'>%s</td>"
                 "<td>%s</td></tr>" % (
                     _cell(row, "source_kind"), _cell(row, "category"), _cell(row, "name"),
                     _cell(row, "size_bytes", "0"), _cell(row, "digest", "N/A"),
@@ -1575,9 +2016,8 @@ def _generate_report_minimal(job_id):
                     _cell(row, "throughput_mb_s", "N/A"),
                     _cell(row, "cpu_utilization_percent", "N/A"),
                     _cell(row, "peak_rss_mb", "N/A"), _cell(row, "threads_used", "N/A"),
-                    _cell(row, "md5", "Not available from Autopsy"),
-                    _cell(row, "sha1", "Not available from Autopsy"),
-                    _cell(row, "sha256", "Not available from Autopsy"),
+                    _cell(row, "md5", "Not available"),
+                    _cell(row, "sha256", "Not available"),
                     _cell(row, "status"),
                 )
             )
@@ -1589,26 +2029,26 @@ body{font:14px Segoe UI,Arial,sans-serif;margin:32px;color:#18202a}h1{margin-bot
 .card b{display:block;font-size:22px}table{border-collapse:collapse;width:100%%;font-size:12px}
 th,td{border:1px solid #dce3ea;padding:6px;vertical-align:top}th{background:#23364d;color:white;position:sticky;top:0}
 .num{text-align:right;white-space:nowrap}.digest{font-family:Consolas,monospace;word-break:break-all}
-</style></head><body><h1>Optimized BLAKE3 Forensic Hash Report</h1>
-<div class='meta'><b>Module:</b> %(module)s %(version)s<br><b>Generated (UTC):</b> %(generated)s<br>
+</style></head><body><h1>BLAKE3 Forensic Hash Report</h1>
+<div class='meta'><b>Module:</b> %(module)s %(version)s<br><b>Configuration:</b> %(configuration)s<br>
+<b>Generated (UTC):</b> %(generated)s<br>
 <b>Engine path:</b> %(engine_path)s<br><b>Engine SHA-256:</b> <span class='digest'>%(engine_sha256)s</span><br>
 <b>Startup validation:</b> %(self_test)s</div>
 <div class='cards'><div class='card'>Hashed<b>%(hashed)s</b></div><div class='card'>Errors<b>%(errors)s</b></div>
 <div class='card'>Skipped<b>%(skipped)s</b></div><div class='card'>Bytes hashed<b>%(bytes)s</b></div>
 <div class='card'>Aggregate E2E MiB/s<b>%(aggregate).3f</b></div></div>
-<div class='note'><b>Measurement scope.</b> End-to-end BLAKE3 timing includes Autopsy Content.read(), Java pipe transfer,
-native hashing, and result parsing. Engine CPU/RSS fields require an executable rebuilt from optimized_blake3.py.
-MD5/SHA-1/SHA-256 values are read from Autopsy's file metadata when another ingest module has populated them; this
-module does not re-hash every file with baseline algorithms, because that would distort BLAKE3 ingest throughput.
-Different algorithms are expected to have different digest text. "Not available" is not a mismatch.
-No per-file double hashing is performed; exact byte-count validation and the published-vector startup test are used.
+<div class='note'><b>Measurement scope.</b> End-to-end timing includes Autopsy Content.read(), transfer to the
+engine over the persistent data stream, hashing, and result parsing. MD5 and SHA-256 columns come from the
+verification passes when they ran. This is the fallback report, written because the full report could not be
+generated; the JSON audit file next to it holds every recorded value.
 The engine executable SHA-256 above supports reproducibility and chain-of-custody documentation.</div>
 <p>Detailed rows omitted because of report safety limit: %(omitted)s</p>
 <table><thead><tr><th>Kind</th><th>Category</th><th>Name</th><th>Bytes</th><th>BLAKE3</th>
 <th>E2E ms</th><th>E2E MiB/s</th><th>CPU %%</th><th>Peak RSS MiB</th><th>Threads</th>
-<th>Autopsy MD5</th><th>Autopsy SHA-1</th><th>Autopsy SHA-256</th><th>Status</th></tr></thead>
+<th>MD5</th><th>SHA-256</th><th>Status</th></tr></thead>
 <tbody>%(rows)s</tbody></table></body></html>""" % {
             "module": _escape(MODULE_NAME), "version": _escape(MODULE_VERSION),
+            "configuration": _escape(stats.get("configuration_label", "")),
             "generated": _escape(datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")),
             "engine_path": _escape(stats.get("engine_path", "")),
             "engine_sha256": _escape(stats.get("engine_sha256", "")),
@@ -1730,7 +2170,7 @@ def _speedup_class(text):
     label = str(text or "").strip()
     if label == "N/A" or label.startswith("Equivalent"):
         return "speedup-equal"
-    if label.startswith("Optimized"):
+    if label.startswith("Evaluated"):
         return "speedup-win"
     return "speedup-loss"
 
@@ -1752,7 +2192,7 @@ def _format_speedup(comparison_ms, optimized_ms, comparison_label="Comparison"):
         if abs(ratio - 1.0) < 0.005:
             return "Equivalent (1.00x)"
         if ratio > 1.0:
-            return "Optimized %.2fx faster" % ratio
+            return "Evaluated run %.2fx faster" % ratio
         return "%s %.2fx faster" % (comparison_label, 1.0 / ratio)
     except Exception:
         return "N/A"
@@ -1801,11 +2241,13 @@ def _algorithm_job_totals(file_rows, evidence, prefix):
         if prefix == "optimized":
             elapsed_key = "end_to_end_elapsed_ms"
             cpu_key = "cpu_utilization_percent"
+            samples_key = "cpu_samples"
             rss_key = "peak_rss_mb"
             evidence_ok = evidence.get("status") == "ok"
         else:
             elapsed_key = prefix + "_elapsed_ms"
             cpu_key = prefix + "_cpu_utilization_percent"
+            samples_key = prefix + "_cpu_samples"
             rss_key = prefix + "_peak_rss_mb"
             evidence_ok = evidence.get(prefix + "_status") == "ok"
 
@@ -1849,7 +2291,8 @@ def _algorithm_job_totals(file_rows, evidence, prefix):
             "bytes": total_bytes,
             "elapsed_ms": total_elapsed,
             "throughput_mb_s": rate,
-            "average_cpu": (sum(cpu_values) / len(cpu_values)) if cpu_values else None,
+            "average_cpu": _run_cpu_mean(
+                rows_ok + ([evidence] if evidence_ok else []), cpu_key, samples_key)[0],
             "peak_rss": max(rss_values) if rss_values else None,
         }
     except Exception as exc:
@@ -1958,6 +2401,21 @@ def _show_report_popup(report_path):
             pass
 
 
+def _configuration_description(code):
+    """Table 7/8 policy of one configuration, in words."""
+    configuration = CONFIGURATIONS[_normalize_configuration(code)]
+    if configuration["algorithm"] != "BLAKE3":
+        return "%s with a fixed 1 MiB buffer, one request per file" % configuration["algorithm"]
+    buffer_text = ("adaptive input buffer (Table 7: 64 KiB to 16 MiB by file size)"
+                   if configuration["adaptive_buffer"] else "fixed 1 MiB input buffer")
+    batch_text = ("files below 32 MiB batched up to %d per request" % BATCH_WINDOW
+                  if configuration["batching"] else "one request per file")
+    thread_text = ("physical-core threads for files of 32 MiB and above"
+                   if configuration["profile"] in ("blake3_threads_only", "blake3_optimized")
+                   else "one hashing thread")
+    return "; ".join([buffer_text, batch_text, thread_text])
+
+
 def _generate_report(job_id):
     """Render the full forensic report after Autopsy completes the data source."""
     with _JOBS_LOCK:
@@ -1967,6 +2425,20 @@ def _generate_report(job_id):
     try:
         rows = stats["rows"]
         _refresh_autopsy_hash_checks(rows)
+        code = _normalize_configuration(stats.get("configuration"))
+        configuration = CONFIGURATIONS[code]
+        primary_label = configuration["label"]
+        # Run results per data source (Eq. 5, 11, 12) and the trials CSV row(s).
+        summaries = _run_summaries(stats, _readable_file_count)
+        try:
+            for summary in summaries:
+                summary["case"] = _safe_case_name()
+            trials_csv = _append_trial_rows(summaries) if summaries else "no rows recorded"
+        except Exception as exc:
+            trials_csv = "not written: " + str(exc)
+        stats["run_summaries"] = summaries
+        stats["trials_csv"] = trials_csv
+        run = summaries[0] if summaries else {}
         evidence_rows = [row for row in rows if row.get("source_kind") == "Evidence source"]
         evidence = evidence_rows[-1] if evidence_rows else {}
         file_rows = [row for row in rows if row.get("source_kind") == "File"]
@@ -1991,26 +2463,24 @@ def _generate_report(job_id):
         # figure below uses the exact same numbers as the Speed Comparison
         # table (they are the same measurement, not two different ones).
         # ------------------------------------------------------------------
-        optimized_totals = _algorithm_job_totals(file_rows, evidence, "optimized")
-        baseline_totals = _algorithm_job_totals(file_rows, evidence, "baseline_blake3")
-        sha256_totals = _algorithm_job_totals(file_rows, evidence, "sha256")
-        sha1_totals = _algorithm_job_totals(file_rows, evidence, "sha1")
-        md5_totals = _algorithm_job_totals(file_rows, evidence, "md5")
+        # Readable files and the complete evidence source are evaluated
+        # separately (Section 1.5), so these totals cover files only; the
+        # evidence source has its own section.
+        optimized_totals = _algorithm_job_totals(file_rows, {}, "optimized")
+        baseline_totals = _algorithm_job_totals(file_rows, {}, "baseline_blake3")
+        sha256_totals = _algorithm_job_totals(file_rows, {}, "sha256")
+        md5_totals = _algorithm_job_totals(file_rows, {}, "md5")
 
-        cpu_values = [
-            value for value in [_numeric(row, "cpu_utilization_percent") for row in successful_files]
-            if value is not None
-        ]
         rss_values = [
             value for value in [_numeric(row, "peak_rss_mb") for row in successful_files]
             if value is not None
         ]
-        average_cpu = sum(cpu_values) / len(cpu_values) if cpu_values else None
+        average_cpu = _run_cpu_mean(successful_files)[0]  # Eq. 5
         peak_rss = max(rss_values) if rss_values else None
 
         reference_counts = {}
         autopsy_check_counts = {}
-        for key in ("md5", "sha1", "sha256"):
+        for key in ("md5", "sha256"):
             reference_counts[key] = len([
                 row for row in successful_files if row.get(key)
             ])
@@ -2165,7 +2635,7 @@ def _generate_report(job_id):
                     "<tr><td>%s</td><td>%s</td><td class='num'>%s</td>"
                     "<td class='digest'>%s</td><td class='digest'>%s</td>"
                     "<td>%s</td><td class='digest'>%s</td>"
-                    "<td class='digest'>%s</td><td class='digest'>%s</td>"
+                    "<td class='digest'>%s</td>"
                     "<td class='num'>%s</td>"
                     "<td class='num'>%s</td><td class='num'>%s</td>"
                     "<td class='num'>%s</td><td>%s</td></tr>" % (
@@ -2176,7 +2646,6 @@ def _generate_report(job_id):
                         _cell(row, "baseline_blake3_digest", "N/A"),
                         baseline_match,
                         reference_digest_cell(row, "md5"),
-                        reference_digest_cell(row, "sha1"),
                         reference_digest_cell(row, "sha256"),
                         _cell(row, "end_to_end_elapsed_ms", "N/A"),
                         _cell(row, "throughput_mb_s", "N/A"),
@@ -2187,7 +2656,7 @@ def _generate_report(job_id):
                 )
             except Exception as exc:
                 detail_rows.append(
-                    "<tr><td>%s</td><td colspan='13'>Row unavailable: %s</td></tr>"
+                    "<tr><td>%s</td><td colspan='12'>Row unavailable: %s</td></tr>"
                     % (_escape(row.get("name", "(unnamed)")), _escape(str(exc)))
                 )
 
@@ -2203,10 +2672,12 @@ def _generate_report(job_id):
                 if prefix == "optimized":
                     elapsed_key = "end_to_end_elapsed_ms"
                     cpu_key = "cpu_utilization_percent"
+                    samples_key = "cpu_samples"
                     rss_key = "peak_rss_mb"
                 else:
                     elapsed_key = prefix + "_elapsed_ms"
                     cpu_key = prefix + "_cpu_utilization_percent"
+                    samples_key = prefix + "_cpu_samples"
                     rss_key = prefix + "_peak_rss_mb"
                 total_bytes = sum([
                     int(row.get("size_bytes", 0)) for row in algorithm_rows
@@ -2219,10 +2690,7 @@ def _generate_report(job_id):
                     / (total_elapsed / 1000.0)
                     if total_elapsed > 0.0 else 0.0
                 )
-                cpu_values = [
-                    value for value in [_numeric(row, cpu_key) for row in algorithm_rows]
-                    if value is not None
-                ]
+                cpu_mean = _run_cpu_mean(algorithm_rows, cpu_key, samples_key)[0]
                 rss_values = [
                     value for value in [_numeric(row, rss_key) for row in algorithm_rows]
                     if value is not None
@@ -2258,8 +2726,7 @@ def _generate_report(job_id):
                         total_bytes,
                         _escape(_format_seconds(total_elapsed)),
                         _escape(_format_rate(throughput)),
-                        ("%.2f %%" % (sum(cpu_values) / len(cpu_values)))
-                        if cpu_values else "N/A",
+                        ("%.2f %%" % cpu_mean) if cpu_mean is not None else "N/A",
                         _format_mib(max(rss_values)) if rss_values else "N/A",
                     )
                 )
@@ -2271,11 +2738,10 @@ def _generate_report(job_id):
                 )
 
         total_rows_html = "".join([
-            _file_algorithm_total_row("Optimized BLAKE3", "optimized", True),
-            _file_algorithm_total_row("Baseline BLAKE3", "baseline_blake3"),
-            _file_algorithm_total_row("SHA-256", "sha256"),
-            _file_algorithm_total_row("SHA-1", "sha1"),
-            _file_algorithm_total_row("MD5", "md5"),
+            _file_algorithm_total_row(primary_label, "optimized", True),
+            _file_algorithm_total_row("Baseline BLAKE3 (verification)", "baseline_blake3"),
+            _file_algorithm_total_row("SHA-256 (verification)", "sha256"),
+            _file_algorithm_total_row("MD5 (verification)", "md5"),
         ])
 
         category_rows = []
@@ -2302,11 +2768,14 @@ def _generate_report(job_id):
         evidence_name = _cell(evidence, "name", "Data source")
         evidence_rss_numeric = _numeric(evidence, "peak_rss_mb")
         evidence_reference_rows = []
-        baseline_match_text = (
-            '<br><span class="badge badge-green">MATCH</span>'
-            if evidence.get("baseline_blake3_matches") is True
-            else '<br><span class="badge badge-red">MISMATCH / UNAVAILABLE</span>'
-        )
+        if evidence.get("baseline_blake3_matches") is True:
+            baseline_match_text = '<br><span class="badge badge-green">MATCH</span>'
+        elif configuration["algorithm"] != "BLAKE3":
+            baseline_match_text = '<br><span class="badge badge-amber">NOT COMPARED (%s RUN)</span>' % (
+                _escape(configuration["algorithm"]))
+        else:
+            baseline_match_text = '<br><span class="badge badge-red">MISMATCH / UNAVAILABLE</span>'
+
         evidence_reference_rows.append(
             "<tr><td class='algorithm'>Baseline BLAKE3</td>"
             "<td>Reference BLAKE3 implementation (fixed 1&nbsp;MiB buffer, single thread)</td>"
@@ -2317,9 +2786,9 @@ def _generate_report(job_id):
                 baseline_match_text,
             )
         )
-        for label, prefix in (("MD5", "md5"), ("SHA-1", "sha1"), ("SHA-256", "sha256")):
+        for label, prefix in (("MD5", "md5"), ("SHA-256", "sha256")):
             evidence_reference_rows.append(
-                "<tr><td class='algorithm'>%s</td><td>Independent reference hash for cross-validation</td>"
+                "<tr><td class='algorithm'>%s</td><td>Verification pass (fixed 1&nbsp;MiB buffer)</td>"
                 "<td>%s</td><td>%s</td><td class='digest'>%s</td></tr>" % (
                     label,
                     _escape(_format_ms(evidence.get(prefix + "_elapsed_ms"))),
@@ -2328,19 +2797,32 @@ def _generate_report(job_id):
                 )
             )
 
-        if COMPARE_EVERY_FILE:
+        if not stats.get("verification_passes"):
             integrity_scope_text = (
-                "Confirms the optimized digest matches an independently computed "
-                "BLAKE3 digest for every file that was hashed, and cross-checks it "
-                "against MD5, SHA-1, and SHA-256 as well."
+                "Verification passes were turned off for this run, so the evaluated "
+                "digests were not compared with an independent baseline BLAKE3 pass."
             )
             speed_comparison_note = (
-                "Every algorithm processed every successfully hashed file (including the "
-                "evidence source) under identical conditions."
+                "Only the evaluated configuration ran. Controlled comparisons between "
+                "configurations use the trials CSV (30 trials per configuration)."
+            )
+            per_file_log_note = "Verification passes were turned off for this run."
+        elif COMPARE_EVERY_FILE:
+            integrity_scope_text = (
+                "After hashing, every file was hashed again in separate full passes with "
+                "baseline BLAKE3, MD5 and SHA-256. A file whose evaluated BLAKE3 digest "
+                "differs from the baseline BLAKE3 digest is marked as an error."
+            )
+            speed_comparison_note = (
+                "Single-run view: the evaluated configuration against the verification "
+                "passes over the same readable files (files only; the evidence source is "
+                "reported separately). The verification passes run after hashing and may "
+                "read from a warmer file cache. The controlled comparison of C0-C4 uses "
+                "separate runs recorded in the trials CSV (30 trials per configuration)."
             )
             per_file_log_note = (
-                "Optimized BLAKE3 and every comparison algorithm (Baseline "
-                "BLAKE3, MD5, SHA-1, SHA-256) cover every readable file."
+                "Every readable file, with its evaluated digest and the baseline BLAKE3, "
+                "MD5 and SHA-256 verification digests."
             )
         else:
             integrity_scope_text = (
@@ -2364,9 +2846,8 @@ def _generate_report(job_id):
                 "explicitly rather than assumed."
             )
             per_file_log_note = (
-                "Optimized BLAKE3 covers every readable file. Comparison "
-                "algorithms use independent full passes over the recorded "
-                "stratified sample."
+                "The evaluated configuration covers every readable file. Verification "
+                "passes cover the recorded stratified sample."
             )
 
         def _comparison_row(label, profile_text, totals, role_text):
@@ -2402,13 +2883,15 @@ def _generate_report(job_id):
             )
 
         optimized_row_html = (
-            "<tr class=\"primary-row\"><td class=\"algorithm\">Optimized BLAKE3"
-            "<span class=\"role\">Production profile</span></td>"
-            "<td>Adaptive I/O buffering with native, multi-threaded tree hashing (%s)</td>"
+            "<tr class=\"primary-row\"><td class=\"algorithm\">%s"
+            "<span class=\"role\">Evaluated configuration</span></td>"
+            "<td>%s (%s)</td>"
             "<td>%s</td><td>%s</td><td><strong>%s</strong></td>"
             "<td>%s</td><td>%s</td>"
             "<td><span class=\"badge badge-blue\">Reference baseline</span></td>"
-            "<td>Digest posted to the case blackboard as the primary result</td></tr>" % (
+            "<td>%s</td></tr>" % (
+                _escape(primary_label),
+                _escape(_configuration_description(code)),
                 _cell(evidence, "simd_tier", "Native runtime dispatch"),
                 _escape(_files_included_label(optimized_totals)),
                 _escape(_format_ms(optimized_totals["elapsed_ms"])),
@@ -2421,34 +2904,30 @@ def _generate_report(job_id):
                     _format_mib(optimized_totals["peak_rss"])
                     if optimized_totals["peak_rss"] is not None else "N/A"
                 ),
+                ("Digest posted to the case blackboard" if configuration["algorithm"] == "BLAKE3"
+                 else "Reference run; no BLAKE3 artifacts posted"),
             )
         )
         comparison_rows_html = (
             optimized_row_html
             + _comparison_row(
                 "Baseline BLAKE3",
-                "Reference configuration: fixed 1&nbsp;MiB buffer, single-threaded, "
-                "same underlying BLAKE3 implementation",
+                "Verification pass: fixed 1&nbsp;MiB buffer, one thread, one request per "
+                "file, same BLAKE3 library",
                 baseline_totals,
-                "Isolates the optimization's contribution from the algorithm itself",
+                "Digest agreement check (Eq. 11)",
             )
             + _comparison_row(
                 "SHA-256",
-                "Independent full-file pass using a fixed I/O buffer",
+                "Verification pass: fixed 1&nbsp;MiB buffer",
                 sha256_totals,
-                "Industry-standard comparison; also checked against Autopsy's stored digest",
-            )
-            + _comparison_row(
-                "SHA-1",
-                "Independent full-file pass using a fixed I/O buffer",
-                sha1_totals,
-                "Industry-standard comparison; also checked against Autopsy's stored digest",
+                "Reference point; also checked against Autopsy's stored digest",
             )
             + _comparison_row(
                 "MD5",
-                "Independent full-file pass using a fixed I/O buffer",
+                "Verification pass: fixed 1&nbsp;MiB buffer",
                 md5_totals,
-                "Industry-standard comparison; also checked against Autopsy's stored digest",
+                "Reference point; also checked against Autopsy's stored digest",
             )
         )
 
@@ -2612,17 +3091,20 @@ section{margin-top:22px}
 <img class="brand-icon" src="autopsy-logo.png" alt="Autopsy logo">
 <span class="brand-name">Autopsy</span>
 </div>
-<div class="sidebar-sub">Optimized Blake3 Hash Report</div></div>
+<div class="sidebar-sub">BLAKE3 Hash Report</div></div>
 <dl class="sidebar-meta">
 <div><dt>Case</dt><dd>%(case_name)s</dd></div>
 <div><dt>Examiner</dt><dd>%(examiner)s</dd></div>
 <div><dt>Evidence</dt><dd>%(evidence_name)s</dd></div>
+<div><dt>Configuration</dt><dd>%(primary_label)s</dd></div>
+<div><dt>Trial block</dt><dd>%(trial_block)s</dd></div>
 <div><dt>Generated</dt><dd>%(generated)s</dd></div>
 </dl>
 <div class="sidebar-scroll">
 <p class="sidebar-label">Contents</p>
 <ol class="toc">
 <li><a href="#executive-summary">Summary</a></li>
+<li><a href="#run-configuration">Run Configuration</a></li>
 <li><a href="#architecture">Integrity &amp; Verification</a></li>
 <li><a href="#algorithm-comparison">Speed Comparison</a></li>
 <li><a href="#evidence-source">Evidence Source Result</a></li>
@@ -2634,7 +3116,7 @@ section{margin-top:22px}
 <div class="sidebar-footer"><button type="button" class="print-btn" onclick="window.print()">Print / Save as PDF</button><a class="top-link" href="#top">Back to top &uarr;</a></div>
 </nav>
 <main class="main" id="main-content"><a id="top"></a>
-<header class="hero"><div class="eyebrow">Autopsy Ingest Report</div><h1>Optimized BLAKE3 Hash Verification Report</h1><p class="hero-subtitle">Hash verification and comparative performance analysis for the evidence source processed during this ingest job.</p></header>
+<header class="hero"><div class="eyebrow">Autopsy Ingest Report</div><h1>BLAKE3 Hash Verification Report</h1><p class="hero-subtitle">%(primary_label)s &middot; hash values, verification and performance measurements for the evidence processed during this ingest job.</p></header>
 <section id="executive-summary"><h2>Executive Summary</h2>
 <div class="stat-strip">
 <div class="stat"><div class="stat-label">Evidence Status</div><div class="status-line"><span class="status-main %(evidence_status_class)s">%(evidence_status)s</span><span class="status-detail">%(evidence_status_detail)s</span></div></div>
@@ -2642,6 +3124,20 @@ section{margin-top:22px}
 <div class="stat"><div class="stat-label">Hashing Speed</div><div class="status-line"><span class="status-main">%(total_time_display)s</span><span class="status-detail">%(hashing_speed_detail)s</span></div></div>
 <div class="stat"><div class="stat-label">Errors / Skipped Files</div><div class="status-line"><span class="status-main %(issues_class)s">%(error_count)s errors, %(skipped_count)s skipped</span><span class="status-detail">%(issues_detail)s</span></div></div>
 </div>
+</section>
+<section id="run-configuration"><h2>Run Configuration</h2><p class="section-note">How this run was configured (thesis Tables 7 and 8) and its accuracy and completeness (Equations 11 and 12).</p>
+<div class="panel"><table class="table-kv">
+<tr><th>Configuration</th><td>%(primary_label)s</td></tr>
+<tr><th>Policy</th><td>%(configuration_description)s</td></tr>
+<tr><th>Trial block</th><td>%(trial_block)s</td></tr>
+<tr><th>Autopsy file ingest threads</th><td>%(ingest_threads)s</td></tr>
+<tr><th>Verification passes</th><td>%(verification_text)s</td></tr>
+<tr><th>Readable files in the data source</th><td>%(readable_files)s</td></tr>
+<tr><th>Report completeness (Eq. 12)</th><td>%(completeness)s</td></tr>
+<tr><th>Digest agreement with baseline BLAKE3 (Eq. 11)</th><td>%(agreement)s</td></tr>
+<tr><th>Run CPU utilization (Eq. 5, files)</th><td>%(average_cpu)s</td></tr>
+<tr><th>Trials CSV</th><td>%(trials_csv)s</td></tr>
+</table></div>
 </section>
 <section id="architecture"><h2>Integrity &amp; Verification</h2>
 <div class="stat-strip">
@@ -2655,23 +3151,23 @@ section{margin-top:22px}
 <tr><td><strong>Evidence cache warm-up consistency</strong></td><td><span class="badge %(warmup_badge)s">%(warmup_main)s<span class="status-detail">%(warmup_detail)s</span></span></td><td>Makes sure the timing numbers aren't skewed by disk caching. The evidence is read once to warm the cache, then read again for the timed digest, and the two digests must match.</td></tr>
 </tbody></table></div>
 <h3>Engine Configuration</h3>
-<p class="section-note">Describes how the optimized profile was run.</p>
+<p class="section-note">Describes how the evaluated configuration was run.</p>
 <div class="panel"><table class="table-kv"><tr><th>SIMD dispatch</th><td>%(simd)s</td></tr><tr><th>Maximum native threads</th><td>%(threads)s</td></tr></table></div>
 </section>
-<section id="algorithm-comparison"><h2>Speed Comparison</h2><p class="section-note">%(speed_comparison_note)s</p><div class="panel"><table><thead><tr><th>Algorithm</th><th>Profile</th><th>Files</th><th>Total Time</th><th>Throughput</th><th>Avg CPU</th><th>Peak Memory</th><th>Relative Performance</th><th>Role</th></tr></thead><tbody>%(comparison_rows)s</tbody></table><div class="legend"><span><i class="dot-green"></i>Optimized BLAKE3 faster</span><span><i class="dot-gray"></i>Equivalent performance</span><span><i class="dot-red"></i>Comparison algorithm faster</span></div></div></section>
-<section id="evidence-source"><h2>Evidence Source Result</h2><p class="section-note">Full-source digest for the complete evidence source, alongside the same independently computed reference algorithms.</p><div class="panel"><table><thead><tr><th>Algorithm</th><th>Role</th><th>Execution Time</th><th>Throughput</th><th>Digest</th></tr></thead><tbody><tr class="primary-row"><td class="algorithm">Optimized BLAKE3</td><td>Primary digest recorded to the case blackboard</td><td>%(evidence_time)s</td><td>%(evidence_rate)s</td><td class="digest">%(evidence_digest)s</td></tr>%(evidence_reference_rows)s</tbody></table><table class="table-kv"><tr><th>SIMD dispatch</th><td>%(simd)s</td></tr><tr><th>Maximum native threads</th><td>%(threads)s</td></tr><tr><th>Engine CPU utilization</th><td>%(evidence_cpu)s</td></tr><tr><th>Engine peak memory</th><td>%(evidence_rss)s</td></tr></table></div></section>
+<section id="algorithm-comparison"><h2>Speed Comparison</h2><p class="section-note">%(speed_comparison_note)s</p><div class="panel"><table><thead><tr><th>Algorithm</th><th>Profile</th><th>Files</th><th>Total Time</th><th>Throughput</th><th>Avg CPU</th><th>Peak Memory</th><th>Relative Performance</th><th>Role</th></tr></thead><tbody>%(comparison_rows)s</tbody></table><div class="legend"><span><i class="dot-green"></i>Evaluated configuration faster</span><span><i class="dot-gray"></i>Equivalent performance</span><span><i class="dot-red"></i>Comparison algorithm faster</span></div></div></section>
+<section id="evidence-source"><h2>Evidence Source Result</h2><p class="section-note">Full-source digest for the complete evidence source, alongside the same independently computed reference algorithms.</p><div class="panel"><table><thead><tr><th>Algorithm</th><th>Role</th><th>Execution Time</th><th>Throughput</th><th>Digest</th></tr></thead><tbody><tr class="primary-row"><td class="algorithm">%(primary_label)s</td><td>Timed pass after the untimed warm-up</td><td>%(evidence_time)s</td><td>%(evidence_rate)s</td><td class="digest">%(evidence_digest)s</td></tr>%(evidence_reference_rows)s</tbody></table><table class="table-kv"><tr><th>SIMD dispatch</th><td>%(simd)s</td></tr><tr><th>Maximum native threads</th><td>%(threads)s</td></tr><tr><th>Engine CPU utilization</th><td>%(evidence_cpu)s</td></tr><tr><th>Engine peak memory</th><td>%(evidence_rss)s</td></tr></table></div></section>
 <section id="benchmark-scope"><h2>Benchmark Details</h2><p class="section-note">Raw counts and cumulative figures underlying the summary and speed comparison above.</p>
 <h3>Coverage</h3>
 <div class="panel"><table class="table-kv"><tr><th>Successfully hashed files</th><td>%(success_count)s</td></tr><tr><th>Data included</th><td>%(file_bytes)s</td></tr><tr><th>Errors</th><td>%(error_count)s</td></tr><tr><th>Detailed rows omitted by safety limit</th><td>%(omitted)s</td></tr></table></div>
 <h3>Cross-Algorithm Verification</h3>
-<p class="section-note">How many files each independent algorithm actually reprocessed, and whether Baseline BLAKE3 agreed with the optimized digest.</p>
-<div class="panel"><table class="table-kv"><tr><th>Baseline BLAKE3 completed</th><td>%(baseline_count)s files</td></tr><tr><th>Baseline digest verification</th><td>%(baseline_match_summary)s</td></tr><tr><th>SHA-256 completed</th><td>%(sha256_count)s files</td></tr><tr><th>SHA-1 completed</th><td>%(sha1_count)s files</td></tr><tr><th>MD5 completed</th><td>%(md5_count)s files</td></tr></table></div>
+<p class="section-note">How many files each verification pass processed, and whether baseline BLAKE3 agreed with the evaluated digest.</p>
+<div class="panel"><table class="table-kv"><tr><th>Baseline BLAKE3 completed</th><td>%(baseline_count)s files</td></tr><tr><th>Baseline digest verification</th><td>%(baseline_match_summary)s</td></tr><tr><th>SHA-256 completed</th><td>%(sha256_count)s files</td></tr><tr><th>MD5 completed</th><td>%(md5_count)s files</td></tr></table></div>
 <h3>Autopsy Stored-Hash Reconciliation</h3>
 <p class="section-note">Comparison against hashes Autopsy already had on file, where another ingest module had populated them.</p>
-<div class="panel"><table class="table-kv"><tr><th>Stored Autopsy SHA-256 checks</th><td>%(autopsy_sha256_summary)s</td></tr><tr><th>Stored Autopsy SHA-1 checks</th><td>%(autopsy_sha1_summary)s</td></tr><tr><th>Stored Autopsy MD5 checks</th><td>%(autopsy_md5_summary)s</td></tr></table></div>
-<h3>Optimized BLAKE3 Performance (files only)</h3>
+<div class="panel"><table class="table-kv"><tr><th>Stored Autopsy SHA-256 checks</th><td>%(autopsy_sha256_summary)s</td></tr><tr><th>Stored Autopsy MD5 checks</th><td>%(autopsy_md5_summary)s</td></tr></table></div>
+<h3>%(primary_label)s Performance (files only)</h3>
 <p class="section-note">Files only, excluding the evidence source.</p>
-<div class="panel"><table class="table-kv"><tr><th>Optimized cumulative time</th><td>%(file_time)s</td></tr><tr><th>Optimized aggregate throughput</th><td>%(aggregate_rate)s</td></tr><tr><th>Average optimized normalized CPU</th><td>%(average_cpu)s</td></tr><tr><th>Maximum optimized peak memory</th><td>%(peak_rss)s</td></tr></table></div>
+<div class="panel"><table class="table-kv"><tr><th>Cumulative end-to-end time</th><td>%(file_time)s</td></tr><tr><th>Aggregate throughput (Eq. 1)</th><td>%(aggregate_rate)s</td></tr><tr><th>CPU utilization (Eq. 5)</th><td>%(average_cpu)s</td></tr><tr><th>Peak memory (Eq. 6)</th><td>%(peak_rss)s</td></tr></table></div>
 </section>
 <section id="file-summary"><h2>File-by-File Summary</h2><p class="section-note">Breakdown of hashed evidence by category, and any files that were skipped.</p><div class="stat-strip">
 <div class="stat"><div class="stat-label">Successfully Hashed</div><div class="stat-value">%(success_count)s</div></div>
@@ -2679,7 +3175,7 @@ section{margin-top:22px}
 <div class="stat"><div class="stat-label">Skipped</div><div class="stat-value">%(skipped_count)s</div></div>
 <div class="stat"><div class="stat-label">Aggregate Throughput</div><div class="stat-value">%(aggregate_rate)s</div></div>
 </div><div class="panel"><h3>Evidence Categories</h3><table><thead><tr><th>Category</th><th>Successfully Hashed</th></tr></thead><tbody>%(category_rows)s</tbody></table><h3>Files Skipped</h3><table><thead><tr><th>Reason</th><th>Count</th></tr></thead><tbody>%(skip_rows)s</tbody></table></div></section>
-<section id="performance-log"><h2>Full Per-File Log</h2><p class="section-note">%(per_file_log_note)s</p><div class="total-summary"><div class="total-summary-heading">Successfully Hashed Files <span>Optimized BLAKE3 Hash</span></div><div class="stat-strip"><div class="stat"><div class="stat-label">Files Hashed</div><div class="stat-value">%(success_count)s</div></div><div class="stat"><div class="stat-label">Data Processed</div><div class="stat-value">%(file_bytes)s</div></div><div class="stat"><div class="stat-label">End-to-End Time</div><div class="stat-value emphasis">%(file_time_seconds)s</div></div><div class="stat"><div class="stat-label">Throughput</div><div class="stat-value emphasis">%(aggregate_rate)s</div></div><div class="stat"><div class="stat-label">Average CPU</div><div class="stat-value">%(average_cpu)s</div></div><div class="stat"><div class="stat-label">Peak Memory</div><div class="stat-value">%(peak_rss)s</div></div></div></div><h3>Individual File Results</h3><div class="panel"><table><thead><tr><th>File</th><th>Category</th><th>Bytes</th><th>Optimized BLAKE3</th><th>Baseline BLAKE3</th><th>Match</th><th>MD5</th><th>SHA-1</th><th>SHA-256</th><th>Optimized End-to-End ms</th><th>Optimized MiB/s</th><th>CPU %%</th><th>Peak Memory</th><th>Status</th></tr></thead><tbody>%(detail_rows)s</tbody></table></div></section>
+<section id="performance-log"><h2>Full Per-File Log</h2><p class="section-note">%(per_file_log_note)s</p><div class="total-summary"><div class="total-summary-heading">Successfully Hashed Files <span>%(primary_label)s</span></div><div class="stat-strip"><div class="stat"><div class="stat-label">Files Hashed</div><div class="stat-value">%(success_count)s</div></div><div class="stat"><div class="stat-label">Data Processed</div><div class="stat-value">%(file_bytes)s</div></div><div class="stat"><div class="stat-label">End-to-End Time</div><div class="stat-value emphasis">%(file_time_seconds)s</div></div><div class="stat"><div class="stat-label">Throughput</div><div class="stat-value emphasis">%(aggregate_rate)s</div></div><div class="stat"><div class="stat-label">Average CPU</div><div class="stat-value">%(average_cpu)s</div></div><div class="stat"><div class="stat-label">Peak Memory</div><div class="stat-value">%(peak_rss)s</div></div></div></div><h3>Individual File Results</h3><div class="panel"><table><thead><tr><th>File</th><th>Category</th><th>Bytes</th><th>Evaluated Digest</th><th>Baseline BLAKE3</th><th>Match</th><th>MD5</th><th>SHA-256</th><th>End-to-End ms</th><th>MiB/s</th><th>CPU %%</th><th>Peak Memory</th><th>Status</th></tr></thead><tbody>%(detail_rows)s</tbody></table></div></section>
 <div class="footer">This report documents hashing results, integrity controls, and performance measurements produced during Autopsy ingest.</div>
 </main>
 </div>
@@ -2752,17 +3248,11 @@ section{margin-top:22px}
             "comparison_rows": comparison_rows_html,
             "success_count": len(successful_files),
             "sha256_count": reference_counts["sha256"],
-            "sha1_count": reference_counts["sha1"],
             "md5_count": reference_counts["md5"],
             "autopsy_sha256_summary": "%d available; %d matched; %d mismatched" % (
                 autopsy_check_counts["sha256"]["available"],
                 autopsy_check_counts["sha256"]["matches"],
                 autopsy_check_counts["sha256"]["mismatches"],
-            ),
-            "autopsy_sha1_summary": "%d available; %d matched; %d mismatched" % (
-                autopsy_check_counts["sha1"]["available"],
-                autopsy_check_counts["sha1"]["matches"],
-                autopsy_check_counts["sha1"]["mismatches"],
             ),
             "autopsy_md5_summary": "%d available; %d matched; %d mismatched" % (
                 autopsy_check_counts["md5"]["available"],
@@ -2792,7 +3282,22 @@ section{margin-top:22px}
             "omitted": stats.get("rows_omitted", 0),
             "category_rows": "".join(category_rows),
             "skip_rows": "".join(skip_rows),
-            "detail_rows": "".join(detail_rows) if detail_rows else "<tr><td colspan='14'>No file rows recorded.</td></tr>",
+            "detail_rows": "".join(detail_rows) if detail_rows else "<tr><td colspan='13'>No file rows recorded.</td></tr>",
+            "primary_label": _escape(primary_label),
+            "configuration_description": _escape(_configuration_description(code)),
+            "trial_block": _escape(stats.get("trial_block", 0) or "0 (not a measured trial)"),
+            "ingest_threads": _escape(stats.get("ingest_threads", "") or "unknown"),
+            "verification_text": (
+                "baseline BLAKE3, MD5 and SHA-256 in separate full passes after hashing"
+                if stats.get("verification_passes") else "turned off"),
+            "readable_files": _escape(run.get("readable_files", "") or "unknown"),
+            "completeness": _escape(_format_percent(run.get("completeness_percent"))
+                                    if run.get("completeness_percent") not in ("", None)
+                                    else "N/A"),
+            "agreement": _escape(_format_percent(run.get("digest_agreement_percent"))
+                                 if run.get("digest_agreement_percent") not in ("", None)
+                                 else "N/A (no baseline BLAKE3 comparison in this run)"),
+            "trials_csv": _escape(trials_csv),
             "total_rows": total_rows_html,
             "module": _escape(MODULE_NAME),
             "version": _escape(MODULE_VERSION),
@@ -2801,7 +3306,6 @@ section{margin-top:22px}
         stats["optimized_job_totals"] = optimized_totals
         stats["baseline_blake3_job_totals"] = baseline_totals
         stats["sha256_job_totals"] = sha256_totals
-        stats["sha1_job_totals"] = sha1_totals
         stats["md5_job_totals"] = md5_totals
 
         output = open(html_path, "wb")

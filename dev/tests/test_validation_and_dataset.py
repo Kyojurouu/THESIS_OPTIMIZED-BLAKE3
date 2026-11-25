@@ -34,20 +34,52 @@ class VerificationTests(unittest.TestCase):
         variants = [o["variant"] for o in result["observations"]]
         self.assertTrue(any("batched" in v for v in variants))
 
-    def test_avalanche_reports_all_diagnostics(self):
-        result = validation.avalanche_analysis(random.Random(1).randbytes(4096), samples=400)
+    def test_avalanche_equation_13(self):
+        inputs = validation.random_inputs(300, 4096, seed=1)
+        result = validation.avalanche_test(inputs)
         self.assertTrue(result["passed"])
-        for key in ("mean_z", "chi_square_p", "sac_bits_outside_band", "interpretation"):
-            self.assertIn(key, result)
-        self.assertIn("Not a security proof", result["interpretation"])
+        self.assertEqual(result["inputs"], 300)
+        self.assertAlmostEqual(result["mean_avalanche_percent"], 50.0, delta=1.5)
 
     def test_empty_input_is_not_applicable(self):
-        self.assertFalse(validation.avalanche_analysis(b"")["applicable"])
+        self.assertFalse(validation.avalanche_test([b""])["applicable"])
 
-    def test_collision_screen_and_balance(self):
-        screen = validation.collision_screen(b"evidence", variants=300)
-        self.assertTrue(screen["passed"])
-        self.assertTrue(validation.bit_balance(screen["digests"])["passed"])
+    def test_collision_rate_equation_15(self):
+        digests = [bytes([i]) * 32 for i in range(5)] + [bytes([1]) * 32]
+        result = validation.collision_test(digests)
+        self.assertEqual(result["collisions_found"], 1)
+        self.assertEqual(result["pairs_compared"], 15)
+        self.assertAlmostEqual(result["collision_rate"], 1 / 15)
+        self.assertFalse(result["passed"])
+
+    def test_distribution_equation_14(self):
+        uniform = [bytes(range(i * 32 % 256, i * 32 % 256 + 32)) for i in range(8 * 40)]
+        result = validation.distribution_test(uniform)
+        self.assertEqual(result["chi_square"], 0.0)
+        self.assertEqual(result["degrees_of_freedom"], 255)
+        self.assertTrue(result["passed"])
+        skewed = validation.distribution_test([bytes(32)] * 100)
+        self.assertFalse(skewed["passed"])
+
+    def test_deterministic_equation_16(self):
+        result = validation.deterministic_test([b"a", b"bc"], repetitions=10)
+        self.assertEqual(result["repetitions"], 20)
+        self.assertEqual(result["deterministic_percent"], 100.0)
+
+    def test_tests_use_the_optimized_engine_path(self):
+        self.assertEqual(validation.optimized_digest(b"abc").hex(),
+                         blake3.blake3(b"abc").hexdigest())
+
+    def test_full_validation_passes_with_paper_sizes(self):
+        result = validation.run_validation()
+        self.assertTrue(result["passed"])
+        codes = [p["procedure"].split()[0] for p in result["procedures"]]
+        self.assertEqual(codes, ["V1", "V2", "V3", "H1", "H2", "H3", "H4"])
+        h1, h2, h3, h4 = result["procedures"][3:]
+        self.assertEqual(h1["digests_compared"], 10000)
+        self.assertEqual(h2["inputs"], 1000)
+        self.assertEqual(h3["digests"], 10000)
+        self.assertEqual(h4["repetitions_per_input"], 10)
 
 
 class DatasetTests(unittest.TestCase):
@@ -115,7 +147,7 @@ class ScaleDatasetTests(unittest.TestCase):
 
     def test_planned_read_volume(self):
         import benchmark_blake3
-        self.assertEqual(benchmark_blake3.planned_read_bytes([10, 20], trials=30, warmups=2), 30 * 7 * 32)
+        self.assertEqual(benchmark_blake3.planned_read_bytes([10, 20], trials=30, warmups=2), 30 * 6 * 32)
         self.assertEqual(benchmark_blake3.planned_read_bytes([10], 10, 0, include_references=False), 400)
 
 

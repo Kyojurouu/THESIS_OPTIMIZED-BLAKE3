@@ -49,9 +49,11 @@ from benchmark_blake3 import (                                    # noqa: E402
 )
 from blake3_validation import (                                   # noqa: E402
     LIMITATIONS,
-    avalanche_analysis,
-    bit_balance,
-    collision_screen,
+    avalanche_test,
+    collision_test,
+    deterministic_test,
+    distribution_test,
+    optimized_digest,
     run_validation,
 )
 from dataset_tool import (                                        # noqa: E402
@@ -194,16 +196,6 @@ def speed_phrase(value: Optional[float]) -> str:
     if not value:
         return "—"
     return "%.2f× faster" % value if value >= 1 else "%.2f× slower" % (1 / value)
-
-
-def interaction_short(value: Optional[float]) -> Tuple[str, str]:
-    if value is None:
-        return "—", "not available"
-    if value > 1.02:
-        return "%.2f" % value, "synergy: they reinforce each other"
-    if value < 0.98:
-        return "%.2f" % value, "overlap: they partly do the same work"
-    return "%.2f" % value, "roughly independent"
 
 
 _VERDICT_TAG = {
@@ -1238,11 +1230,13 @@ class HashFilesTab(_Tab):
 
 class FileAnalysisTab(_Tab):
     _AVALANCHE_SAMPLES = 1000
+    _AVALANCHE_BYTES = 64 * 1024
     _COLLISION_VARIANTS = 300
+    _REPETITIONS = 10
     _BENCHMARK_REPEATS = 7
     _BENCHMARK_WARMUPS = 2
     _MODES = {
-        "All logical cores (optimized threading)": "optimized",
+        "Physical cores (optimized threading)": "optimized",
         "One thread (baseline threading)": "baseline",
     }
 
@@ -1284,8 +1278,8 @@ class FileAnalysisTab(_Tab):
                  anchor="w", justify="left", wraplength=980).pack(fill="x", pady=(10, 0))
 
         diag = _section(self.body, "Hash behaviour",
-                        "Checks on the selected file (or its first 4 MiB). These are empirical "
-                        "diagnostics, not proofs of security.", step=3)
+                        "The Section 3.5 tests applied to this file, through the optimized engine. "
+                        "Supporting observations, not proofs of security.", step=3)
         self._diag = _table(diag, [
             ("check", "Check", 260, "w"), ("result", "Result", 130, "w"),
             ("observed", "Observed", 340, "w"), ("expected", "Expected", 290, "w"),
@@ -1329,7 +1323,7 @@ class FileAnalysisTab(_Tab):
 
     def _work(self, path: str, mode: str, progress) -> Dict[str, Any]:
         initial = Path(path).stat()
-        threads = 1 if mode == "baseline" else logical_cpu_count()
+        threads = 1 if mode == "baseline" else physical_cpu_count()
         progress("Loading file into RAM (not timed)…", 0.05)
         try:
             snapshot = load_file_snapshot(path, max_bytes=recommended_memory_benchmark_limit())
@@ -1352,17 +1346,23 @@ class FileAnalysisTab(_Tab):
             digest = bench.digest
         sample = bytes(memoryview(snapshot.data)[:4 * MIB])
         del snapshot
-        progress("Avalanche analysis (%d single-bit flips)…" % self._AVALANCHE_SAMPLES, 0.45)
-        avalanche = avalanche_analysis(sample, samples=self._AVALANCHE_SAMPLES)
-        progress("Duplicate-hash screen…", 0.75)
-        collisions = collision_screen(sample, variants=self._COLLISION_VARIANTS)
-        balance = bit_balance(collisions.pop("digests"))
+        progress("Deterministic output (×%d)…" % self._REPETITIONS, 0.45)
+        determinism = deterministic_test([sample], repetitions=self._REPETITIONS)
+        head = sample[:self._AVALANCHE_BYTES]
+        progress("Avalanche effect (%d single-bit flips)…" % self._AVALANCHE_SAMPLES, 0.6)
+        avalanche = avalanche_test([head] * self._AVALANCHE_SAMPLES) if head else {"applicable": False}
+        progress("Collision and distribution tests…", 0.8)
+        digests = [optimized_digest(head + index.to_bytes(8, "little"))
+                   for index in range(self._COLLISION_VARIANTS)]
+        collisions = collision_test(digests)
+        balance = distribution_test(digests)
         final = Path(path).stat()
         if final.st_size != initial.st_size or final.st_mtime_ns != initial.st_mtime_ns:
             raise RuntimeError("The evidence file changed during analysis")
         return {"path": path, "size": int(initial.st_size), "digest": digest, "bench": bench,
                 "complete": bench.bytes_hashed == initial.st_size,
-                "avalanche": avalanche, "collisions": collisions, "balance": balance}
+                "avalanche": avalanche, "collisions": collisions, "balance": balance,
+                "determinism": determinism}
 
     def _done(self, result):
         self.busy = False
@@ -1379,34 +1379,34 @@ class FileAnalysisTab(_Tab):
                  % (format_size(bench.bytes_hashed), format_size(result["size"])))
         self._perf_note.set("In-memory median of %d trials after %d warm-ups over the %s. File loading "
                             "is excluded from the timer." % (bench.repeats, bench.warmups, scope))
-        a, c, b = result["avalanche"], result["collisions"], result["balance"]
-        rows = []
+        a, c, b, d = (result["avalanche"], result["collisions"], result["balance"],
+                      result["determinism"])
+        rows = [("Same hash every time (Eq. 16)", d["passed"],
+                 "D = %.1f %% over %d repetitions" % (d["deterministic_percent"], d["repetitions"]),
+                 "100 %")]
         if a.get("applicable"):
-            rows += [
-                ("One-bit change alters about half the hash", a["mean_test_passed"],
-                 "%.1f of 256 bits changed on average (%.1f %%)" % (a["mean_changed_bits"],
-                                                                    a["mean_changed_percent"]),
-                 "about 128 of 256 (50 %)"),
-                ("Changes follow the expected spread", a["chi_square_passed"],
-                 "χ² p = %s" % fmt_p(a["chi_square_p"]), "no unusual pattern (p > 0.001)"),
-                ("Every output bit reacts equally", a["sac_passed"],
-                 "each bit flipped %.0f–%.0f %% of the time" % (a["sac_min_probability"] * 100,
-                                                                a["sac_max_probability"] * 100),
-                 "close to 50 % for every bit"),
-            ]
+            rows.append(("One-bit change alters about half the hash (Eq. 13)", a["passed"],
+                         "AE = %.2f %% over %d flips" % (a["mean_avalanche_percent"], a["inputs"]),
+                         "close to 50 %"))
         else:
-            rows.append(("Avalanche", None, "not applicable (empty file)", "—"))
+            rows.append(("Avalanche (Eq. 13)", None, "not applicable (empty file)", "—"))
         rows += [
-            ("No duplicate hashes", c["passed"],
-             "%d duplicates among %d inputs" % (len(c["duplicates"]), c["inputs_tested"]), "0 duplicates"),
-            ("Balanced 0s and 1s in hashes", b["passed"], "%.2f %% ones" % b["ones_percent"], "about 50 %"),
+            ("No collisions (Eq. 15)", c["passed"],
+             "%d collisions among %d digests (CR %.2g)" % (c["collisions_found"], c["digests_compared"],
+                                                          c["collision_rate"]), "0 collisions"),
+            ("Uniform digest bytes (Eq. 14)", b["passed"],
+             "χ² = %.1f, p = %s" % (b["chi_square"], fmt_p(b["p_value"])), "not significant (p ≥ 0.05)"),
         ]
         for name, passed, observed, expected in rows:
             text = "n/a" if passed is None else ("✔ As expected" if passed else "✘ Unusual")
             tags = () if passed is None else (("pass",) if passed else ("fail",))
             tree_insert(self._diag, (name, text, observed, expected), tags)
-        self._scope_var.set("Sample: %s. %s" % (
-            "entire file" if result["size"] <= 4 * MIB else "first 4 MiB", LIMITATIONS))
+        self._scope_var.set(
+            "Determinism: %s. Avalanche, collision and distribution: the first 64 KiB and %d indexed "
+            "variants of it. The full protocol (1,000 random inputs, 10,000 digests) is on the Correctness "
+            "Verification page. %s" % (
+                "entire file" if result["size"] <= 4 * MIB else "first 4 MiB",
+                self._COLLISION_VARIANTS, LIMITATIONS))
         self._progress.finish("Analysis complete")
         self.status("Analysis complete for %s" % Path(result["path"]).name)
 
@@ -1485,31 +1485,34 @@ def _comparison_row_values(name, item, comparison, *, reference=False):
         speed = fmt_speedup(comparison["speedup"])
         ci = fmt_ci(comparison["speedup_ci95"])
         change = fmt_num(comparison["percent_time_reduction"], "%+.1f %%")
-        p = fmt_p(comparison.get("p_holm"))
-        delta = "%.2f (%s)" % (comparison["cliffs_delta"], comparison["cliffs_magnitude"])
+        p = "%s (%s)" % (fmt_p(comparison.get("p_holm")),
+                         "t" if comparison.get("test") == "paired t-test" else "W")
+        delta = ("%.2f (%s)" % (comparison["cohens_d"], comparison["effect_magnitude"])
+                 if comparison.get("cohens_d") is not None else "—")
         verdict = verdict_text(comparison["verdict"], reference)
     return (
-        name, verdict, fmt_ms(stats["median"]), fmt_ci(item["elapsed_median_ci95"], "%.2f"),
-        fmt_num(stats["cv_percent"], "%.1f %%"), fmt_num(item["throughput_mib_s"]["median"], "%.0f"),
-        fmt_num(item["cpu_percent_median"], "%.1f %%"), fmt_num(item["peak_rss_mib_median"], "%.0f"),
+        name, verdict, fmt_ms(stats["mean"]), fmt_ci(stats["ci95"], "%.2f"),
+        fmt_num(stats["cv_percent"], "%.1f %%"), fmt_num(item["throughput_mib_s"]["mean"], "%.0f"),
+        fmt_num(item["cpu_percent"]["mean"], "%.1f %%"), fmt_num(item["peak_rss_mib"]["mean"], "%.0f"),
         speed, ci, change, p, delta,
     )
 
 
 _RESULT_COLUMNS = [
     ("config", "Configuration", 260, "w"), ("verdict", "Result", 190, "w"),
-    ("median", "Median", 85, "e"), ("ci", "95% CI (ms)", 135, "e"), ("cv", "CV", 60, "e"),
+    ("median", "Mean", 85, "e"), ("ci", "95% CI (ms)", 135, "e"), ("cv", "CV", 60, "e"),
     ("thr", "MiB/s", 65, "e"), ("cpu", "CPU", 65, "e"), ("rss", "Peak MiB", 75, "e"),
     ("speed", "Speedup", 110, "e"), ("sci", "Speedup CI", 115, "e"),
-    ("change", "Time Δ", 75, "e"), ("p", "p Holm", 70, "e"), ("delta", "Cliff's δ", 120, "w"),
+    ("change", "Time Δ", 75, "e"), ("p", "p Holm (test)", 95, "e"), ("delta", "Effect d", 120, "w"),
 ]
 
 _GLOSSARY = (
-    "Median: middle time of all trials.  95% CI: range the true value is expected to lie in.  "
-    "CV: round-to-round variation (≤ 10 % is stable).  Speedup: baseline time ÷ this configuration's "
-    "time.  p Holm: chance the difference is noise, corrected for several comparisons (< 0.05 counts). "
-    "Cliff's δ: effect size from −1 to 1.  '✔ Faster' needs p Holm < 0.05 and the whole speedup CI "
-    "above 1.0×."
+    "Mean and 95% CI: Eq. 7 and 9 (t critical value).  CV: Eq. 10 (≤ 10 % is stable).  "
+    "Speedup: mean baseline time ÷ mean configuration time (Eq. 3).  p Holm (test): Holm-corrected p of "
+    "the paired t-test (t) when Shapiro–Wilk finds the paired differences normal, otherwise the Wilcoxon "
+    "signed-rank test (W).  Effect d: mean paired difference ÷ its SD (Eq. 18).  '✔ Faster' needs "
+    "p Holm < 0.05 with a positive mean difference.  Speedup CI: range implied by the 95 % CI of the "
+    "mean paired difference."
 )
 
 
@@ -1572,11 +1575,12 @@ class TechniqueBenchmarkTab(_Tab):
         _cap(head, "File", bg="bg").pack(side="right")
         self._banner = Banner(self.body, bg="bg")
         self._banner.pack(fill="x", padx=24, pady=(0, 10))
-        self._tiles = tile_row(self.body, ["Optimized vs baseline", "Adaptive buffering effect",
-                                           "Multithreading effect", "Interaction"])
+        self._tiles = tile_row(self.body, ["C4 vs C0", "C1 buffer sizing only",
+                                           "C3 threading only", "Parallel portion P (Eq. 17)"])
 
         chart = _section(self.body, "Speedup over Baseline BLAKE3",
-                         "Bars show the median speedup; whiskers show the 95 % confidence interval.")
+                         "Bars show the mean speedup (Eq. 3); whiskers show the range implied by the 95 % "
+                         "confidence interval of the mean paired difference.")
         self._chart = SpeedupChart(chart)
         self._chart.pack(fill="x")
 
@@ -1729,12 +1733,16 @@ class TechniqueBenchmarkTab(_Tab):
                    fmt_speedup(optimized["speedup"]), fmt_ci(optimized["speedup_ci95"]),
                    fmt_p(optimized.get("p_holm"))),
                 {"success": "success", "danger": "danger"}.get(tone, "info"))
-        f = report["factorial"]
-        if f.get("effect_a") is not None:
-            self._tiles[1].set("×%.3f" % f["effect_a"], "geometric-mean main effect")
-            self._tiles[2].set("×%.3f" % f["effect_b"], "geometric-mean main effect")
-            value, meaning = interaction_short(f["interaction"])
-            self._tiles[3].set(value, meaning)
+        for tile, key in ((self._tiles[1], "buffer_only"), (self._tiles[2], "threads_only")):
+            comparison = comparisons.get(("technique", key))
+            if comparison:
+                tile.set(fmt_speedup(comparison["speedup"]), verdict_text(comparison["verdict"]))
+        amdahl = report.get("amdahl", {}).get("optimized")
+        if amdahl and amdahl.get("parallel_fraction") is not None:
+            self._tiles[3].set("%.2f" % amdahl["parallel_fraction"],
+                               "implied by C4 on %d threads" % amdahl["threads"])
+        else:
+            self._tiles[3].set("—", "file below the 32 MiB threading threshold")
         if report["warnings"]:
             self._notes.set(self._notes.get().split("\nFile notes:")[0] + "\nFile notes: " + " ".join(report["warnings"]))
 
@@ -1801,10 +1809,11 @@ class SmallFileTab(_Tab):
                    size="sm").pack(side="right")
         self._banner = Banner(self.body, bg="bg")
         self._banner.pack(fill="x", padx=24, pady=(0, 10))
-        self._tiles = tile_row(self.body, ["Optimized vs sequential", "Batching effect",
-                                           "Parallel workers effect", "Interaction"])
+        self._tiles = tile_row(self.body, ["Parallel + batched vs sequential", "Batching only",
+                                           "Parallel workers only", "Test used (best)"])
         chart = _section(self.body, "Speedup over sequential per-file hashing",
-                         "Bars show the median speedup; whiskers show the 95 % confidence interval.")
+                         "Bars show the mean speedup (Eq. 3); whiskers show the range implied by the 95 % "
+                         "confidence interval of the mean paired difference.")
         self._chart = SpeedupChart(chart)
         self._chart.pack(fill="x")
         details = _section(self.body, "Detailed statistics")
@@ -1870,7 +1879,7 @@ class SmallFileTab(_Tab):
         for key, item in report["summary"].items():
             comparison = comparisons.get(key)
             values = list(_comparison_row_values(item["label"], item, comparison))
-            values.insert(6, "%.0f" % item["files_per_second_median"])
+            values.insert(6, "%.0f" % item["files_per_second_mean"])
             tags = ("base",) if comparison is None else (_VERDICT_TAG.get(comparison["verdict"], "neutral"),)
             tree_insert(self._table, values, tags)
             if comparison:
@@ -1891,12 +1900,12 @@ class SmallFileTab(_Tab):
                     {"success": "faster", "danger": "slower"}.get(tone, "not clearly different"),
                     fmt_speedup(best["speedup"]), fmt_ci(best["speedup_ci95"]), fmt_p(best.get("p_holm"))),
                 {"success": "success", "danger": "danger"}.get(tone, "info"))
-        f = report["factorial"]
-        if f.get("effect_a") is not None:
-            self._tiles[1].set("×%.3f" % f["effect_a"], "geometric-mean main effect")
-            self._tiles[2].set("×%.3f" % f["effect_b"], "geometric-mean main effect")
-            value, meaning = interaction_short(f["interaction"])
-            self._tiles[3].set(value, meaning)
+        for tile, key in ((self._tiles[1], "sequential_batched"), (self._tiles[2], "parallel")):
+            comparison = comparisons.get(key)
+            if comparison:
+                tile.set(fmt_speedup(comparison["speedup"]), verdict_text(comparison["verdict"]))
+        if best:
+            self._tiles[3].set(best["test"], "Shapiro–Wilk p = %s" % fmt_p(best.get("shapiro_p")))
         exports = report["exports"]
         self._notes.set(
             "Workload: %d files, %s, median %s per file · %d workers · %d files per batch · worker start-up "
@@ -1927,11 +1936,11 @@ class SmallFileTab(_Tab):
 _CHECK_NAMES = {
     "V1": "Matches the official BLAKE3 test values",
     "V2": "Agrees with an independent BLAKE3 implementation",
-    "V3": "Same hash with every setting and optimization",
-    "V4": "Same hash every time",
-    "V5": "Small input change → large hash change (avalanche)",
-    "V6a": "No duplicate hashes found",
-    "V6b": "Balanced 0s and 1s in the hashes",
+    "V3": "Same hash with every setting, configuration and engine profile",
+    "H1": "Collision test (Eq. 15)",
+    "H2": "Avalanche effect test (Eq. 13)",
+    "H3": "Hash distribution test (Eq. 14)",
+    "H4": "Deterministic output test (Eq. 16)",
 }
 
 
@@ -1950,16 +1959,17 @@ class VerificationTab(_Tab):
         FlatButton(row, "Browse…", self._browse).pack(side="left", padx=(0, 8))
         FlatButton(row, "Use synthetic input", lambda: self._path.set(""), kind="ghost").pack(side="left")
         _cap(setup, "Leave empty to use a seeded synthetic input that crosses the multithreading threshold. "
-                    "A chosen file is used for the consistency check and its first 4 MiB for the "
-                    "behaviour checks.", wraplength=980, justify="left").pack(fill="x", pady=(8, 0))
+                    "A chosen file is used for the consistency check (V3). The hash-behaviour tests H1–H4 "
+                    "use seeded random inputs through the optimized engine, as in Section 3.5.",
+             wraplength=980, justify="left").pack(fill="x", pady=(8, 0))
         opts = frame(setup)
         opts.pack(fill="x", pady=(12, 0))
-        _cap(opts, "Avalanche samples").pack(side="left")
+        _cap(opts, "Avalanche inputs").pack(side="left")
         self._samples = tk.IntVar(value=1000)
         spinbox(opts, self._samples, from_=100, to=20000, increment=100, width=7).pack(
             side="left", padx=(6, 18), ipady=3)
-        _cap(opts, "Duplicate-screen inputs").pack(side="left")
-        self._variants = tk.IntVar(value=2000)
+        _cap(opts, "Collision / distribution digests").pack(side="left")
+        self._variants = tk.IntVar(value=10000)
         spinbox(opts, self._variants, from_=100, to=100000, increment=500, width=8).pack(
             side="left", padx=6, ipady=3)
         action = frame(setup)
@@ -2011,7 +2021,7 @@ class VerificationTab(_Tab):
         self._banner.hide()
 
         def work(progress, cancel):
-            result = run_validation(path, avalanche_samples=samples, collision_variants=variants,
+            result = run_validation(path, avalanche_inputs=samples, distribution_digests=variants,
                                     progress=progress)
             RESULTS_DIR.mkdir(parents=True, exist_ok=True)
             out = RESULTS_DIR / ("verification_%s.json" % timestamp())
@@ -2036,17 +2046,19 @@ class VerificationTab(_Tab):
         if name.startswith("V3"):
             return "%d variants, %d mismatches (%s)" % (p["variants_tested"], len(p["mismatches"]),
                                                        format_size(p["input_bytes"]))
-        if name.startswith("V4"):
-            return "%d repetitions, %d distinct hash(es)" % (p["repetitions"], p["distinct_digests"])
-        if name.startswith("V5"):
+        if name.startswith("H1"):
+            return "%d digests, %d collisions, CR = %.3g" % (
+                p["digests_compared"], p["collisions_found"], p["collision_rate"])
+        if name.startswith("H2"):
             if not p.get("applicable"):
                 return "not applicable"
-            return "mean %.1f bits (z %.2f) · χ² p %s · %d bit(s) outside band" % (
-                p["mean_changed_bits"], p["mean_z"], fmt_p(p["chi_square_p"]), p["sac_bits_outside_band"])
-        if name.startswith("V6a"):
-            return "%d inputs, %d duplicates" % (p["inputs_tested"], len(p["duplicates"]))
-        if name.startswith("V6b"):
-            return "%.2f %% ones (z %.2f)" % (p["ones_percent"], p["z"])
+            return "mean AE %.3f %% over %d inputs (z %.2f vs 50 %%)" % (
+                p["mean_avalanche_percent"], p["inputs"], p["z_vs_50_percent"])
+        if name.startswith("H3"):
+            return "χ² = %.1f, df %d, p = %s" % (p["chi_square"], p["degrees_of_freedom"],
+                                                fmt_p(p["p_value"]))
+        if name.startswith("H4"):
+            return "D = %.1f %% (%d repetitions)" % (p["deterministic_percent"], p["repetitions"])
         return ""
 
     def _done(self, result):
@@ -2077,7 +2089,7 @@ class VerificationTab(_Tab):
         if not self._result or not self._table.selection():
             return
         procedure = dict(self._result["procedures"][int(self._table.selection()[0])])
-        for bulky in ("cases", "observations", "lengths", "histogram_16_bins"):
+        for bulky in ("cases", "observations", "lengths", "inputs_with_differences"):
             if bulky in procedure and isinstance(procedure[bulky], list) and len(procedure[bulky]) > 12:
                 procedure[bulky] = "%d entries (see the saved JSON report)" % len(procedure[bulky])
         self._detail.configure(fg=P["text"])
@@ -2311,11 +2323,11 @@ class OverviewTab(_Tab):
         grid.pack(fill="x", padx=24, pady=(0, 16))
         for index, (icon, name, detail, page, page_name) in enumerate((
             ("▤", "Adaptive buffer sizing",
-             "The input buffer adapts to file size instead of a fixed 1 MiB: small buffers for small "
-             "files and, from %d MiB, the whole file through a zero-copy memory map (with a background-"
-             "read fallback)." % (SMALL_FILE_LIMIT // MIB), "technique", "Technique Evaluation"),
+             "The input buffer follows file size instead of a fixed 1 MiB (Table 7: 64 KiB below "
+             "512 KiB up to 16 MiB from 1 GiB). Large local files of %d MiB or more are memory-mapped "
+             "on SSD/NVMe storage." % (SMALL_FILE_LIMIT // MIB), "technique", "Technique Evaluation"),
             ("⚡", "Multithreading for large files",
-             "Files of %d MiB or more use BLAKE3's own tree-parallel mode on all logical cores. Smaller "
+             "Files of %d MiB or more use BLAKE3's own tree-parallel mode on the physical cores. Smaller "
              "files stay single-threaded because starting threads costs more than it saves."
              % (SMALL_FILE_LIMIT // MIB), "technique", "Technique Evaluation"),
             ("▦", "Batching small files",
@@ -2352,13 +2364,13 @@ class OverviewTab(_Tab):
             pass
         for name, value in (
             ("Processor", info["cpu_model"]),
-            ("Parallel threads", "%d logical (%d physical cores) — used for large files" % (
-                info["logical_threads"], info["physical_cores"])),
+            ("Parallel threads", "%d physical cores used for large files (%d logical threads)" % (
+                info["physical_cores"], info["logical_threads"])),
             ("Memory", "%s GB" % info["memory_gib"] if info["memory_gib"] else "unknown"),
             ("SIMD", info["simd_tier"]),
             ("Drives", " · ".join(drives) or "unknown"),
-            ("Large-file strategy", "SSD/NVMe: memory-mapped in %d MiB windows on all threads · HDD or "
-             "network: sequential background reads" % (256)),
+            ("Large-file strategy", "SSD/NVMe: memory-mapped in %d MiB windows on the physical cores · "
+             "HDD or network: sequential background reads with the Table 7 buffer" % (256)),
         ):
             row = frame(machine)
             row.pack(fill="x", pady=2)
@@ -2383,9 +2395,9 @@ class OverviewTab(_Tab):
         for number, (tier, modules, role) in enumerate((
             ("Presentation", "main_app.py", "Interface: input selection, progress, tables, charts, export."),
             ("Experiment control", "benchmark_blake3.py · blake3_validation.py · dataset_tool.py",
-             "Experiments and statistics (formulas F1–F19), verification with an independent reference BLAKE3, dataset manifests."),
+             "Experiments and statistics (thesis Equations 1–19), verification with an independent reference BLAKE3, dataset manifests."),
             ("Measurement", "_MetricSampler · FORMULAS (benchmark_blake3.py)",
-             "Timing, CPU and memory sampling; Wilcoxon, bootstrap, Cliff's δ, Holm."),
+             "Timing, CPU and memory sampling; Shapiro–Wilk, paired t / Wilcoxon, Holm, Cohen's d (Section 3.5)."),
             ("Hashing engine", "optimized_blake3.py → blake3 native extension",
              "Adaptive policy, configurations, batching, Hash Files logic and hash lists; standard BLAKE3 with native SIMD."),
         ), 1):
@@ -2441,7 +2453,7 @@ class MethodologyTab(_Tab):
         super().__init__(parent, app)
         _heading(self.body, "Methodology",
                  "Every reported value is computed with one of the following formulas, implemented in "
-                 "dev/benchmark_blake3.py, and is referenced by its identifier (F1–F19).", eyebrow="System")
+                 "dev/benchmark_blake3.py, numbered as Equations 1–19 of thesis Chapter 3.", eyebrow="System")
         actions = frame(self.body, bg="bg")
         actions.pack(fill="x", padx=24, pady=(0, 14))
         FlatButton(actions, "Export as Markdown", self._export, kind="primary").pack(side="left")

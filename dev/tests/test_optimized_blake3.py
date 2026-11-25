@@ -15,7 +15,7 @@ import optimized_blake3 as engine
 from optimized_blake3 import SMALL_FILE_LIMIT, OperationCancelled
 
 fh = engine  # hash_paths / hash lists
-from blake3_validation import avalanche_effect, deterministic_correctness
+from blake3_validation import avalanche_test, deterministic_correctness, random_inputs
 
 
 class PolicyTests(unittest.TestCase):
@@ -29,16 +29,30 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.max_threads, 4)
         self.assertTrue(policy.use_mmap)
 
-    def test_large_streamed_input_uses_pipeline_chunk(self):
-        # Streams (e.g. the Autopsy pipe) cannot be mapped; they use the 4 MiB chunk.
+    def test_large_streamed_input_uses_table7_buffer(self):
+        # Streams (e.g. the Autopsy pipe) cannot be mapped; Table 7 gives 8 MiB here.
         policy = engine.select_policy(150 * engine.MIB, threads=8, allow_mmap=False)
-        self.assertEqual(policy.chunk_size, engine.PIPELINE_CHUNK_BYTES)
+        self.assertEqual(policy.chunk_size, 8 * engine.MIB)
         self.assertEqual(policy.max_threads, 8)
         self.assertFalse(policy.use_mmap)
 
-    def test_default_threads_use_all_logical_cores(self):
+    def test_default_threads_use_physical_cores(self):
+        # Thesis Table 7 / Section 3.4: detected physical CPU-core count.
         policy = engine.select_policy(engine.SMALL_FILE_LIMIT)
-        self.assertEqual(policy.max_threads, engine.logical_cpu_count())
+        self.assertEqual(policy.max_threads, engine.physical_cpu_count())
+
+    def test_adaptive_buffer_matches_table7(self):
+        kib, mib, gib = 1024, engine.MIB, 1024 * engine.MIB
+        table7 = [  # (input size, expected reusable buffer)
+            (0, 64 * kib), (512 * kib - 1, 64 * kib),
+            (512 * kib, 256 * kib), (4 * mib - 1, 256 * kib),
+            (4 * mib, 512 * kib), (32 * mib - 1, 512 * kib),
+            (32 * mib, 2 * mib), (128 * mib - 1, 2 * mib),
+            (128 * mib, 8 * mib), (gib - 1, 8 * mib),
+            (gib, 16 * mib), (2 * 1024 * gib, 16 * mib),
+        ]
+        for size, expected in table7:
+            self.assertEqual(engine.adaptive_chunk_size(size), expected, size)
 
 
 class HashingTests(unittest.TestCase):
@@ -142,6 +156,54 @@ class HashingTests(unittest.TestCase):
         self.assertEqual(result["digest"], engine.KNOWN_VECTORS[payload])
         self.assertIn("baseline", result["profile"])
 
+    def test_stream_profiles_follow_table8(self):
+        size = engine.SMALL_FILE_LIMIT + 5
+        payload = os.urandom(size)
+        expected = blake3.blake3(payload).hexdigest()
+        cores = engine.physical_cpu_count()
+        table8 = {  # profile: (input buffer, native threads)
+            "blake3_baseline": (engine.MIB, 1),                       # C0 / C2
+            "blake3_buffer_only": (engine.adaptive_chunk_size(size), 1),  # C1
+            "blake3_threads_only": (engine.MIB, cores),               # C3
+            "blake3_optimized": (engine.adaptive_chunk_size(size), cores),  # C4
+        }
+        for profile, (buffer, threads) in table8.items():
+            result = engine.hash_stream_profile(io.BytesIO(payload), size, profile=profile,
+                                                collect_metrics=False)
+            self.assertEqual(result.digest, expected, profile)
+            self.assertEqual((result.chunk_size, result.threads_used), (buffer, threads), profile)
+
+    def test_unsupported_profile_keeps_stream_synchronized(self):
+        request = (json.dumps({"size": 3, "profile": "bogus"}).encode() + b"\nabc"
+                   + json.dumps({"size": 3, "profile": "blake3_optimized"}).encode() + b"\nabc")
+        response = io.BytesIO()
+        engine.serve_forever(io.BytesIO(request), response)
+        first, second = [json.loads(line) for line in response.getvalue().splitlines()]
+        self.assertEqual(first["status"], "error")
+        self.assertEqual(second["digest"], engine.KNOWN_VECTORS[b"abc"])
+
+    def test_batch_reuses_one_buffer_and_gives_each_file_its_digest(self):
+        files = [b"abc", b"", os.urandom(70_000)]
+        header = {"batch": len(files),
+                  "requests": [{"size": len(f), "profile": "blake3_optimized"} for f in files]}
+        request = json.dumps(header).encode() + b"\n" + b"".join(files)
+        response = io.BytesIO()
+        engine.serve_forever(io.BytesIO(request), response)
+        digests = [json.loads(line)["digest"] for line in response.getvalue().splitlines()]
+        self.assertEqual(digests, [blake3.blake3(f).hexdigest() for f in files])
+        self.assertIs(engine._reusable_buffer(64 * 1024), engine._reusable_buffer(64 * 1024))
+
+    def test_cpu_utilization_is_mean_of_samples(self):
+        sampler = engine._MetricSampler(True)
+        with sampler:
+            end = __import__("time").perf_counter() + 0.06
+            while __import__("time").perf_counter() < end:
+                pass
+            _elapsed, cpu, _process, _rss = sampler.finish()
+        self.assertGreaterEqual(sampler.cpu_sample_count, 2)
+        self.assertAlmostEqual(cpu, sum(sampler._samples) / len(sampler._samples))
+        self.assertTrue(0.0 <= cpu <= 100.0)
+
 
 class TechniqueConfigTests(unittest.TestCase):
     def test_factor_levels_map_to_policies(self):
@@ -207,11 +269,11 @@ class TechniqueConfigTests(unittest.TestCase):
 
 class PipelineAndFallbackTests(unittest.TestCase):
     def test_pipelined_update_matches_reference(self):
-        for size in (0, 1, 4096, engine.PIPELINE_CHUNK_BYTES, 3 * engine.PIPELINE_CHUNK_BYTES + 77):
+        chunk = 2 * engine.MIB
+        for size in (0, 1, 4096, chunk, 3 * chunk + 77):
             payload = os.urandom(size)
             hasher = blake3.blake3(max_threads=2)
-            count = engine._pipelined_update(hasher, io.BytesIO(payload), size,
-                                             engine.PIPELINE_CHUNK_BYTES)
+            count = engine._pipelined_update(hasher, io.BytesIO(payload), size, chunk)
             self.assertEqual(count, size)
             self.assertEqual(hasher.hexdigest(), blake3.blake3(payload).hexdigest())
 
@@ -397,7 +459,7 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(deterministic_correctness()["passed"])
 
     def test_avalanche_diagnostic(self):
-        self.assertTrue(avalanche_effect(samples=64)["passed"])
+        self.assertTrue(avalanche_test(random_inputs(64, 1024, seed=3))["passed"])
 
 
 

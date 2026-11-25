@@ -12,16 +12,23 @@ V2  Independent cross-implementation check – native package vs the reference
 V3  Configuration consistency – the same input must yield one digest under
     every buffer size, thread count, I/O path (stream, mmap, in-memory, small-
     file batch worker) and every factorial configuration of the study.
-V4  Repeatability – repeated hashing of the same input is deterministic.
-V5  Avalanche diagnostics – Hamming distance distribution (mean z-test,
-    chi-square fit to Binomial(256, ½)) and the strict avalanche criterion.
-V6  Output bit balance and duplicate-digest screen.
+
+Hash-behaviour tests of thesis Section 3.5 (computed through the optimized
+engine path):
+
+H1  Collision test - identical digests among 10,000 distinct random inputs,
+    collision rate CR (Eq. 15).
+H2  Avalanche effect - one bit flipped in each of 1,000 random inputs,
+    AE = HD / 256 x 100 (Eq. 13), expected close to 50 %.
+H3  Hash distribution - chi-square of the byte values of the same 10,000
+    digests against a uniform distribution (Eq. 14), not significant at 0.05.
+H4  Deterministic output - each input hashed ten times, D (Eq. 16) = 100 %.
 
 Scope of conclusions
 --------------------
-V1–V4 establish that *this implementation and its optimizations* compute
-standard BLAKE3 correctly. V5–V6 are empirical diagnostics that the outputs
-behave as expected for a well-mixed hash on the tested inputs. None of them
+V1-V3 establish that *this implementation and its optimizations* compute
+standard BLAKE3 correctly. H1-H4 are supporting observations that the outputs
+behave as expected on the tested inputs. None of them
 proves collision resistance, preimage resistance, or any other security
 property; those rest on the published cryptanalysis of BLAKE3, which this
 study neither modifies nor re-evaluates.
@@ -44,7 +51,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import blake3
 
-from benchmark_blake3 import binomial_bins, chi_square_sf
+from benchmark_blake3 import chi_square_sf
 from optimized_blake3 import (
     BLAKE3_CONFIGS,
     MIB,
@@ -54,6 +61,9 @@ from optimized_blake3 import (
     hash_file,
     hash_file_config,
     hash_stream,
+    hash_stream_profile,
+    serve_forever,
+    STREAM_CONFIG_PROFILES,
     logical_cpu_count,
     physical_cpu_count,
     self_test,
@@ -434,7 +444,7 @@ def configuration_consistency(
 
         buffers = [64 * 1024, 256 * 1024, 512 * 1024, 1 * MIB, 2 * MIB, 8 * MIB, 16 * MIB]
         thread_counts = sorted({1, 2, physical_cpu_count(), logical_cpu_count()})
-        steps = len(buffers) * len(thread_counts) + 8
+        steps = len(buffers) * len(thread_counts) + 14
         done = 0
         for buffer in buffers:
             for threads in thread_counts:
@@ -464,6 +474,17 @@ def configuration_consistency(
                     blake3.blake3(data, max_threads=blake3.blake3.AUTO).hexdigest())
             observe("stream API (hash_stream)",
                     hash_stream(io.BytesIO(data), len(data), collect_metrics=False).digest)
+            for profile in STREAM_CONFIG_PROFILES:  # the Autopsy engine profiles (Table 8)
+                observe("Autopsy stream profile " + profile,
+                        hash_stream_profile(io.BytesIO(data), len(data), profile=profile,
+                                            collect_metrics=False).digest)
+            request = (json.dumps({"batch": 2, "requests": [
+                {"size": len(data), "profile": "blake3_optimized"},
+                {"size": len(data), "profile": "blake3_baseline"}]}).encode() + b"\n" + data + data)
+            response = io.BytesIO()
+            serve_forever(io.BytesIO(request), response)
+            for line, label in zip(response.getvalue().splitlines(), ("C4", "C0")):
+                observe("Autopsy batch request (%s profile)" % label, json.loads(line).get("digest", ""))
         if size < SMALL_FILE_LIMIT:
             observe("small-file worker (unbatched)", _small_file_worker(str(file_path))[0])
             observe("small-file worker (batched)", _small_batch_worker([str(file_path)])[0][0])
@@ -487,146 +508,154 @@ def configuration_consistency(
             temporary.cleanup()
 
 
-# ── V4 ──────────────────────────────────────────────────────────────────────
+# ── Hash-behaviour tests of thesis Section 3.5 (Eq. 13–16) ──────────────────
+# Every digest below is computed through the optimized engine's stream path
+# (hash_stream_profile, profile "blake3_optimized": Table 7 buffer, physical-core
+# threads at 32 MiB and above), so the tests observe the optimized
+# implementation, not only the underlying library.
 
-def repeatability(payload: bytes, repetitions: int = 50) -> Dict[str, Any]:
-    digests = {blake3.blake3(payload, max_threads=blake3.blake3.AUTO if i % 2 else 1).hexdigest()
-               for i in range(repetitions)}
+AVALANCHE_INPUTS = 1000          # random inputs, one bit flipped in each
+AVALANCHE_INPUT_BYTES = 4096     # 4 BLAKE3 chunks, so the Merkle tree is exercised
+DISTRIBUTION_DIGESTS = 10000     # digests of distinct random inputs
+DISTRIBUTION_INPUT_BYTES = 64
+REPETITIONS = 10                 # deterministic-output repetitions per input
+LARGE_DETERMINISM_BYTES = SMALL_FILE_LIMIT + 8 * MIB + 3  # crosses the threading threshold
+CHI_SQUARE_ALPHA = 0.05
+
+
+def optimized_digest(data: bytes) -> bytes:
+    """BLAKE3 digest of ``data`` computed by the optimized engine's stream path."""
+    result = hash_stream_profile(io.BytesIO(data), len(data), profile="blake3_optimized",
+                                 collect_metrics=False)
+    if result.status != "ok":
+        raise RuntimeError("optimized engine failed: %s" % result.error)
+    return bytes.fromhex(result.digest)
+
+
+def random_inputs(count: int, size: int, seed: int) -> List[bytes]:
+    """Seeded, distinct random inputs (an 8-byte index prefix guarantees distinctness)."""
+    rng = random.Random(seed)
+    return [index.to_bytes(8, "little") + rng.randbytes(max(0, size - 8)) for index in range(count)]
+
+
+def collision_test(digests: Sequence[bytes]) -> Dict[str, Any]:
+    """Eq. 15: identical digests among the N digests of distinct inputs."""
+    n = len(digests)
+    pairs = n * (n - 1) // 2
+    counts: Dict[bytes, int] = {}
+    for digest in digests:
+        counts[digest] = counts.get(digest, 0) + 1
+    collisions = sum(c * (c - 1) // 2 for c in counts.values() if c > 1)
     return {
-        "procedure": "V4 repeatability",
-        "passed": len(digests) == 1,
-        "repetitions": repetitions,
-        "distinct_digests": len(digests),
-        "interpretation": "Hashing the same bytes repeatedly yields one digest.",
+        "procedure": "H1 collision test",
+        "passed": collisions == 0,
+        "digests_compared": n,
+        "pairs_compared": pairs,
+        "collisions_found": collisions,
+        "collision_rate": collisions / pairs if pairs else 0.0,
+        "expected": "no collisions",
+        "interpretation": "No two distinct inputs produced the same digest. With 2^256 possible "
+                          "digests a collision is not expected before about 2^128 inputs, so "
+                          "this does not establish collision resistance.",
     }
 
 
-# ── V5 ──────────────────────────────────────────────────────────────────────
-
-def avalanche_analysis(
-    payload: bytes, samples: int = 1000, seed: int = 0xA11A1A
-) -> Dict[str, Any]:
-    """Single-bit-flip analysis on ``payload`` (formulas F15–F18)."""
-    if not payload:
-        return {"procedure": "V5 avalanche", "passed": False, "applicable": False,
-                "error": "empty input has no bit to flip"}
+def avalanche_test(inputs: Sequence[bytes], seed: int = 0xA11A1A) -> Dict[str, Any]:
+    """Eq. 13: flip one random bit in each input and compare the two digests."""
     rng = random.Random(seed)
-    original = bytearray(payload)
-    original_digest = blake3.blake3(original).digest()
-    positions = rng.sample(range(len(original) * 8), min(samples, len(original) * 8))
+    effects: List[float] = []
     distances: List[int] = []
-    bit_flips = [0] * 256
-    for position in positions:
-        byte_index, bit_index = divmod(position, 8)
-        original[byte_index] ^= 1 << bit_index
-        digest = blake3.blake3(original).digest()
-        original[byte_index] ^= 1 << bit_index
-        diff = bytes(a ^ b for a, b in zip(original_digest, digest))
-        distances.append(sum(b.bit_count() for b in diff))
-        for byte_number, value in enumerate(diff):
-            for bit in range(8):
-                if value >> bit & 1:
-                    bit_flips[byte_number * 8 + bit] += 1
-    n = len(distances)
-    mean = statistics.fmean(distances)
-    sd = statistics.stdev(distances) if n > 1 else 0.0
-    z = (mean - 128.0) / (8.0 / math.sqrt(n))
-
-    bins = binomial_bins(256, 0.5, n)
-    observed = [sum(1 for d in distances if lo <= d <= hi) for lo, hi, _e in bins]
-    chi_square = sum((o - e) ** 2 / e for o, (_lo, _hi, e) in zip(observed, bins))
-    df = max(1, len(bins) - 1)
-    chi_p = chi_square_sf(chi_square, df)
-
-    probabilities = [count / n for count in bit_flips]
-    band = Z_CRITICAL * math.sqrt(0.25 / n)
-    outside = [i for i, p in enumerate(probabilities) if abs(p - 0.5) > band]
-    expected_outside = 256 * 0.001
-    # Allow a generous count before flagging: Poisson(0.256) exceeds 3 with p < 0.003.
-    sac_passed = len(outside) <= 3
-
-    histogram = [0] * 16
-    for d in distances:
-        histogram[min(15, d * 16 // 256)] += 1
-    passed = abs(z) < Z_CRITICAL and chi_p > 0.001 and sac_passed
+    for data in inputs:
+        if not data:
+            continue
+        original = optimized_digest(bytes(data))
+        changed = bytearray(data)
+        position = rng.randrange(len(changed) * 8)
+        changed[position // 8] ^= 1 << (position % 8)
+        flipped = optimized_digest(bytes(changed))
+        distance = sum((a ^ b).bit_count() for a, b in zip(original, flipped))
+        distances.append(distance)
+        effects.append(distance / 256 * 100)  # Eq. 13
+    if not effects:
+        return {"procedure": "H2 avalanche effect test", "passed": False, "applicable": False,
+                "error": "no non-empty inputs"}
+    n = len(effects)
+    mean = statistics.fmean(effects)
+    sd = statistics.stdev(effects) if n > 1 else 0.0
+    # Expected AE = 50 % with SD 100·√(256·¼)/256 = 3.125 % for an ideal hash.
+    z = (mean - 50.0) / (3.125 / math.sqrt(n))
     return {
-        "procedure": "V5 avalanche diagnostics",
-        "passed": passed,
-        "applicable": True,
-        "samples": n,
-        "input_bytes": len(payload),
-        "seed": seed,
-        "mean_changed_bits": round(mean, 3),
-        "mean_changed_percent": round(mean / 256 * 100, 3),
-        "stdev_bits": round(sd, 3),
-        "expected_mean_bits": 128.0,
-        "expected_stdev_bits": 8.0,
-        "minimum_bits": min(distances),
-        "maximum_bits": max(distances),
-        "mean_z": round(z, 3),
-        "mean_test_passed": abs(z) < Z_CRITICAL,
-        "chi_square": round(chi_square, 3),
-        "chi_square_df": df,
-        "chi_square_p": chi_p,
-        "chi_square_passed": chi_p > 0.001,
-        "sac_min_probability": round(min(probabilities), 4),
-        "sac_max_probability": round(max(probabilities), 4),
-        "sac_band": [round(0.5 - band, 4), round(0.5 + band, 4)],
-        "sac_bits_outside_band": len(outside),
-        "sac_expected_outside_by_chance": round(expected_outside, 3),
-        "sac_passed": sac_passed,
-        "histogram_16_bins": histogram,
-        "interpretation": "Empirical diagnostic: single-bit input changes alter about half of the "
-                          "output bits, independently per output bit, on the tested input. "
-                          "Not a security proof.",
-    }
-
-
-# ── V6 ──────────────────────────────────────────────────────────────────────
-
-def collision_screen(payload: bytes, variants: int = 2000, seed: int = 0xC0111510) -> Dict[str, Any]:
-    rng = random.Random(seed)
-    seen: Dict[bytes, int] = {blake3.blake3(payload).digest(): -1}
-    digests = [next(iter(seen))]
-    duplicates = []
-    for index in range(variants):
-        variant = bytes(payload) + index.to_bytes(8, "little") + rng.randbytes(8)
-        digest = blake3.blake3(variant).digest()
-        if digest in seen:
-            duplicates.append((seen[digest], index))
-        else:
-            seen[digest] = index
-        digests.append(digest)
-    return {
-        "procedure": "V6a duplicate-digest screen",
-        "passed": not duplicates,
-        "inputs_tested": variants + 1,
-        "duplicates": duplicates,
-        "digests": [d.hex() for d in digests],
-        "interpretation": "No duplicate digests among the tested inputs. With 2^256 possible "
-                          "outputs, a duplicate would only be expected after about 2^128 inputs, "
-                          "so this screen cannot demonstrate collision resistance.",
-    }
-
-
-def bit_balance(digest_hexes: Sequence[str]) -> Dict[str, Any]:
-    values = [bytes.fromhex(h) for h in digest_hexes]
-    if not values:
-        return {"procedure": "V6b output bit balance", "passed": False, "error": "no digests"}
-    ones = sum(b.bit_count() for value in values for b in value)
-    total = len(values) * 256
-    fraction = ones / total
-    z = (ones - total / 2) / math.sqrt(total / 4)
-    return {
-        "procedure": "V6b output bit balance",
+        "procedure": "H2 avalanche effect test",
         "passed": abs(z) < Z_CRITICAL,
-        "digests_tested": len(values),
-        "total_bits": total,
-        "ones": ones,
-        "zeros": total - ones,
-        "ones_percent": round(fraction * 100, 3),
-        "z": round(z, 3),
-        "interpretation": "Ones and zeros occur in roughly equal proportion (F19).",
+        "applicable": True,
+        "inputs": n,
+        "input_bytes": len(inputs[0]),
+        "seed": seed,
+        "mean_avalanche_percent": round(mean, 4),
+        "sd_avalanche_percent": round(sd, 4),
+        "mean_changed_bits": round(statistics.fmean(distances), 3),
+        "min_changed_bits": min(distances),
+        "max_changed_bits": max(distances),
+        "z_vs_50_percent": round(z, 3),
+        "criterion": "average avalanche effect close to 50 % (|z| < 3.29 against 50 %, "
+                     "SD of an ideal hash = 3.125 %)",
+        "interpretation": "A one-bit input change altered about half of the 256 output bits.",
+    }
+
+
+def distribution_test(digests: Sequence[bytes]) -> Dict[str, Any]:
+    """Eq. 14: chi-square of the digest byte values against a uniform distribution."""
+    observed = [0] * 256
+    for digest in digests:
+        for value in digest:
+            observed[value] += 1
+    total = sum(observed)
+    expected = total / 256.0
+    chi_square = sum((o - expected) ** 2 / expected for o in observed) if expected else 0.0
+    p_value = chi_square_sf(chi_square, 255)
+    return {
+        "procedure": "H3 hash distribution test",
+        "passed": p_value >= CHI_SQUARE_ALPHA,
+        "digests": len(digests),
+        "bytes_counted": total,
+        "expected_per_byte_value": expected,
+        "chi_square": round(chi_square, 3),
+        "degrees_of_freedom": 255,
+        "p_value": p_value,
+        "criterion": "chi-square not significant at the 0.05 level",
+        "min_observed": min(observed),
+        "max_observed": max(observed),
+        "interpretation": "Digest byte values are consistent with a uniform distribution.",
+    }
+
+
+def deterministic_test(inputs: Sequence[bytes], repetitions: int = REPETITIONS) -> Dict[str, Any]:
+    """Eq. 16: hash each input ``repetitions`` times; every repetition must be identical."""
+    identical = total = 0
+    differing: List[int] = []
+    for index, data in enumerate(inputs):
+        first = optimized_digest(data)
+        identical += 1
+        total += 1
+        for _ in range(repetitions - 1):
+            total += 1
+            if optimized_digest(data) == first:
+                identical += 1
+            elif index not in differing:
+                differing.append(index)
+    determinism = 100.0 * identical / total if total else 0.0
+    return {
+        "procedure": "H4 deterministic output test",
+        "passed": identical == total,
+        "inputs": len(inputs),
+        "repetitions_per_input": repetitions,
+        "repetitions": total,
+        "identical_repeated_digests": identical,
+        "deterministic_percent": determinism,
+        "largest_input_bytes": max((len(d) for d in inputs), default=0),
+        "inputs_with_differences": differing,
+        "interpretation": "Hashing the same input repeatedly always gives the same digest, "
+                          "including inputs large enough to use multithreaded hashing.",
     }
 
 
@@ -635,11 +664,16 @@ def bit_balance(digest_hexes: Sequence[str]) -> Dict[str, Any]:
 def run_validation(
     path: Optional[os.PathLike[str] | str] = None,
     *,
-    avalanche_samples: int = 1000,
-    collision_variants: int = 2000,
-    sample_bytes: int = 4 * MIB,
+    avalanche_inputs: int = AVALANCHE_INPUTS,
+    distribution_digests: int = DISTRIBUTION_DIGESTS,
+    repetitions: int = REPETITIONS,
     progress: ProgressCallback = None,
 ) -> Dict[str, Any]:
+    """Supporting correctness checks (V1–V3) and the hash-behaviour tests (H1–H4).
+
+    ``path`` (optional) is used only by the configuration-consistency check V3;
+    H1–H4 use seeded random inputs, as specified in Section 3.5.
+    """
     def report(message: str, fraction: float) -> None:
         if progress:
             progress(message, fraction)
@@ -647,34 +681,38 @@ def run_validation(
     started = time.perf_counter()
     report("V1 official test vectors…", 0.02)
     vectors = official_test_vectors()
-    report("V2 cross-implementation check…", 0.12)
+    report("V2 cross-implementation check…", 0.10)
     cross = reference_cross_check()
-    report("V3 configuration consistency…", 0.25)
+    report("V3 configuration consistency…", 0.20)
     consistency = configuration_consistency(
-        path, progress=lambda m, f: report(m, 0.25 + 0.4 * f))
-    if path is not None:
-        with open(path, "rb") as source:
-            sample = source.read(sample_bytes)
-        sample_scope = ("entire file" if os.path.getsize(path) <= sample_bytes
-                        else "first %d MiB of the file" % (sample_bytes // MIB))
-    else:
-        sample = random.Random(0x5A3E).randbytes(64 * 1024)
-        sample_scope = "64 KiB seeded random input"
-    report("V4 repeatability…", 0.68)
-    repeat = repeatability(sample)
-    report("V5 avalanche analysis…", 0.72)
-    avalanche = avalanche_analysis(sample, samples=avalanche_samples)
-    report("V6 duplicate screen and bit balance…", 0.88)
-    collisions = collision_screen(sample, variants=collision_variants)
-    balance = bit_balance(collisions.pop("digests"))
+        path, progress=lambda m, f: report(m, 0.20 + 0.3 * f))
+    report("H1/H3 hashing %d distinct random inputs…" % distribution_digests, 0.52)
+    digests = [optimized_digest(data) for data in
+               random_inputs(distribution_digests, DISTRIBUTION_INPUT_BYTES, seed=0xD157)]
+    collisions = collision_test(digests)
+    distribution = distribution_test(digests)
+    report("H2 avalanche effect (%d inputs)…" % avalanche_inputs, 0.66)
+    avalanche_set = random_inputs(avalanche_inputs, AVALANCHE_INPUT_BYTES, seed=0xA7A1)
+    avalanche = avalanche_test(avalanche_set)
+    report("H4 deterministic output (×%d)…" % repetitions, 0.80)
+    large = random.Random(0xB16).randbytes(LARGE_DETERMINISM_BYTES)
+    determinism = deterministic_test(list(avalanche_set) + [large], repetitions=repetitions)
     report("Verification complete", 1.0)
-    procedures = [vectors, cross, consistency, repeat, avalanche, collisions, balance]
+    procedures = [vectors, cross, consistency, collisions, avalanche, distribution, determinism]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "passed": all(p.get("passed") for p in procedures if p.get("applicable", True)),
         "input": str(path) if path else "synthetic",
-        "diagnostic_sample_scope": sample_scope,
+        "hash_behaviour_inputs": {
+            "collision_and_distribution": "%d distinct random inputs of %d bytes (seeded)"
+                                          % (distribution_digests, DISTRIBUTION_INPUT_BYTES),
+            "avalanche": "%d random inputs of %d bytes, one random bit flipped in each (seeded)"
+                         % (avalanche_inputs, AVALANCHE_INPUT_BYTES),
+            "deterministic": "the %d avalanche inputs plus one %d-byte input, each hashed %d times"
+                             % (avalanche_inputs, LARGE_DETERMINISM_BYTES, repetitions),
+            "engine_path": "optimized engine stream path (profile blake3_optimized)",
+        },
         "engine_self_test": self_test(),
         "procedures": procedures,
         "limitations": LIMITATIONS,
@@ -682,7 +720,7 @@ def run_validation(
     }
 
 
-# Backward-compatible wrappers used by older callers/tests.
+# Backward-compatible wrapper used by older callers/tests.
 def deterministic_correctness(seed: int = 0xB1A3E3) -> Dict[str, Any]:
     rng = random.Random(seed)
     failures = []
@@ -697,11 +735,6 @@ def deterministic_correctness(seed: int = 0xB1A3E3) -> Dict[str, Any]:
     return {"passed": not failures, "failures": failures}
 
 
-def avalanche_effect(payload_size: int = 4096, samples: int = 256, seed: int = 0xA11A1A):
-    payload = random.Random(seed).randbytes(payload_size)
-    return avalanche_analysis(payload, samples=samples, seed=seed)
-
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -709,13 +742,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception:
             pass
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("path", nargs="?", help="optional file to verify against")
-    parser.add_argument("--avalanche-samples", type=int, default=1000)
-    parser.add_argument("--collision-variants", type=int, default=2000)
+    parser.add_argument("path", nargs="?", help="optional file for the consistency check (V3)")
+    parser.add_argument("--avalanche-inputs", type=int, default=AVALANCHE_INPUTS)
+    parser.add_argument("--distribution-digests", type=int, default=DISTRIBUTION_DIGESTS)
+    parser.add_argument("--repetitions", type=int, default=REPETITIONS)
     parser.add_argument("--output", help="write the JSON report here")
     args = parser.parse_args(argv)
-    result = run_validation(args.path, avalanche_samples=args.avalanche_samples,
-                            collision_variants=args.collision_variants)
+    result = run_validation(args.path, avalanche_inputs=args.avalanche_inputs,
+                            distribution_digests=args.distribution_digests,
+                            repetitions=args.repetitions)
     encoded = json.dumps(result, indent=2)
     if args.output:
         Path(args.output).write_text(encoded, encoding="utf-8")

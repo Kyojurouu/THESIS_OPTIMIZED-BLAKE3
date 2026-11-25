@@ -9,11 +9,15 @@ done here.
 The public API is ``hash_file()``, ``hash_stream()``, ``hash_file_config()``,
 ``hash_small_files()`` and, for everyday multi-file hashing with hash lists,
 ``hash_paths()`` / ``write_hash_report()`` / ``verify_hash_list()``.  The
-``--server`` mode is a persistent length-prefixed bridge for Autopsy/Jython:
+``--server`` mode is the persistent data stream used by the Autopsy/Jython
+ingest module (thesis Section 3.4):
 
-    <ASCII byte count>\n<exactly that many raw bytes>
+    {"size": N, "profile": P}\n<exactly N raw bytes>
+    {"batch": M, "requests": [{"size": N0, "profile": P0}, ...]}\n<N0 + N1 + ... bytes>
 
-One compact JSON result line is returned for each request.
+One compact JSON result line is returned per file, in request order. Profiles
+are listed in STREAM_PROFILES (C0-C4 engine profiles and the MD5 / SHA-256
+references of Table 8).
 """
 
 from __future__ import annotations
@@ -67,8 +71,6 @@ SMALL_FILE_LIMIT = int(os.environ.get("BLAKE3_SMALL_FILE_LIMIT", str(32 * MIB)))
 # Files at or above this size are hashed from a memory map (zero-copy, whole
 # file in one update) so BLAKE3's tree parallelism can use every core.
 MMAP_MIN_BYTES = SMALL_FILE_LIMIT
-# Read size for the background-read fallback (best measured value).
-PIPELINE_CHUNK_BYTES = 4 * MIB
 # Large files are mapped in windows of this size: full multithreaded speed,
 # memory use bounded (~ one window) for files of any size, and a progress /
 # cancel point after every window. Must be a multiple of the OS allocation
@@ -119,12 +121,16 @@ class HashResult:
     algorithm: str
     profile: str
     error: Optional[str] = None
+    # Number of psutil CPU samples behind cpu_utilization_percent (Eq. 5), so a
+    # caller can combine requests into one run-level mean over all samples.
+    cpu_samples: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
         # Compatibility names used by the original Autopsy plugin.
         result["message"] = self.error or ""
         result["threads_semantics"] = "maximum native worker threads"
+        result["physical_cores"] = physical_cpu_count()
         return result
 
 
@@ -304,22 +310,24 @@ def benchmark_memory(
 
 
 def adaptive_chunk_size(size_bytes: int) -> int:
-    """Choose the streaming read buffer; BLAKE3's internal chunk is still 1 KiB.
+    """Reusable input-buffer size of Table 7 (thesis Chapter 3).
 
-    Small buffers suit small files (single-threaded hashing is fastest when the
-    buffer stays in CPU cache). Large files are memory-mapped instead (see
-    MMAP_MIN_BYTES), so their effective buffer is the whole file.
+    BLAKE3's internal 1 KiB chunks are unaffected. Streamed input (the Autopsy
+    path) is always read with this buffer; local large files may instead be
+    memory-mapped (see MMAP_MIN_BYTES), in which case this size is used only
+    by the background-read fallback.
     """
-    if size_bytes < 512 * 1024:       # < 512 KiB  — tiny files
+    if size_bytes < 512 * 1024:          # below 512 KiB
         return 64 * 1024
-    if size_bytes < 4 * MIB:          # 512 KiB – 4 MiB — small
+    if size_bytes < 4 * MIB:             # 512 KiB to below 4 MiB
         return 256 * 1024
-    if size_bytes < SMALL_FILE_LIMIT:  # 4 MiB – SMALL_FILE_LIMIT — medium
+    if size_bytes < SMALL_FILE_LIMIT:    # 4 MiB to below 32 MiB
         return 512 * 1024
-    # ≥ SMALL_FILE_LIMIT — large: the file is normally memory-mapped (the buffer is
-    # the whole file); this size applies to streamed input and the background-read
-    # fallback, where 4 MiB measured fastest.
-    return PIPELINE_CHUNK_BYTES
+    if size_bytes < 128 * MIB:           # 32 MiB to below 128 MiB
+        return 2 * MIB
+    if size_bytes < 1024 * MIB:          # 128 MiB to below 1 GiB
+        return 8 * MIB
+    return 16 * MIB                      # 1 GiB and above
 
 
 def select_policy(
@@ -341,7 +349,8 @@ def select_policy(
         max_threads = 1
         strategy = "buffered-single-thread"
     else:
-        requested = logical_cpu_count() if threads is None else int(threads)
+        # Thread Policy Controller (Table 7): detected physical CPU cores.
+        requested = physical_cpu_count() if threads is None else int(threads)
         max_threads = max(1, requested)
         if workload == "latency":
             max_threads = min(max_threads, 2)
@@ -566,12 +575,20 @@ def _windows_peak_rss_bytes() -> Optional[int]:
 
 
 class _MetricSampler:
-    """Low-frequency RSS sampling plus high-resolution wall/CPU deltas.
+    """psutil sampling every 10 ms of CPU utilization and resident memory.
+
+    Thesis Equation 5: CPU utilization is the mean of the n samples taken in a
+    run, where each sample u_i is the normalized CPU use over its own sampling
+    interval (CPU-time delta / wall-time delta / logical processors x 100).
+    The interval from the last sample to the end of the run is the final
+    sample, so a run shorter than one interval has n = 1.
+    Equation 6: peak memory is the largest RSS sample.
 
     With ``include_children=True`` CPU time and RSS cover the whole process
-    tree, which is required when work is dispatched to worker processes
-    (their CPU time is otherwise invisible to ``time.process_time``).
+    tree, which is required when work is dispatched to worker processes.
     """
+
+    SAMPLE_INTERVAL_S = 0.010
 
     def __init__(self, enabled: bool = True, include_children: bool = False) -> None:
         self.enabled = enabled
@@ -584,6 +601,11 @@ class _MetricSampler:
         self._process = _psutil.Process(os.getpid()) if enabled and _psutil else None
         if self.include_children and self._process is None:
             self._process = _psutil.Process(os.getpid())
+        self._samples: List[float] = []
+        self._last_wall_ns = 0
+        self._last_cpu = 0.0
+        self._sample_lock = threading.Lock()
+        self._logical = logical_cpu_count()
 
     def _tree(self) -> List[Any]:
         assert self._process is not None
@@ -605,7 +627,7 @@ class _MetricSampler:
         return total
 
     def _cpu_now(self) -> float:
-        if not self.include_children:
+        if self._process is None:
             return time.process_time()
         total = 0.0
         for member in self._tree():
@@ -620,30 +642,47 @@ class _MetricSampler:
         if self._process is not None and (self.enabled or self.include_children):
             try:
                 self.peak_rss = self._rss_now()
-                if self.enabled:
-                    self._thread = threading.Thread(target=self._sample, daemon=True)
-                    self._thread.start()
             except Exception:
                 self._process = None
                 self.include_children = False
         self.cpu_start = self._cpu_now()
         self.wall_start_ns = time.perf_counter_ns()
+        self._last_wall_ns = self.wall_start_ns
+        self._last_cpu = self.cpu_start
+        if self._process is not None and self.enabled:
+            self._thread = threading.Thread(target=self._sample, daemon=True)
+            self._thread.start()
         return self
+
+    def _take_cpu_sample(self) -> None:
+        """Record u_i for the interval since the previous sample (Eq. 5)."""
+        with self._sample_lock:
+            wall_ns = time.perf_counter_ns()
+            cpu = self._cpu_now()
+            interval_s = (wall_ns - self._last_wall_ns) / 1e9
+            if interval_s > 0:
+                used = max(0.0, cpu - self._last_cpu)
+                # Windows CPU-time counters advance in ~15.6 ms ticks, so a short
+                # interval can appear to exceed 100 %; a process cannot use more
+                # than every logical processor, hence the clamp.
+                self._samples.append(min(100.0, 100.0 * used / interval_s / self._logical))
+            self._last_wall_ns, self._last_cpu = wall_ns, cpu
 
     def _sample(self) -> None:
         assert self._process is not None
-        while not self._stop.wait(0.010):
+        while not self._stop.wait(self.SAMPLE_INTERVAL_S):
             try:
                 self.peak_rss = max(self.peak_rss, self._rss_now())
+                self._take_cpu_sample()
             except Exception:
                 return
 
     def finish(self) -> Tuple[float, Optional[float], Optional[float], Optional[float]]:
         elapsed_s = max(0.0, (time.perf_counter_ns() - self.wall_start_ns) / 1e9)
-        cpu_s = max(0.0, self._cpu_now() - self.cpu_start)
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=0.1)
+        self._take_cpu_sample()  # the final (possibly partial) interval
         if self._process is not None:
             try:
                 self.peak_rss = max(self.peak_rss, self._rss_now())
@@ -658,11 +697,15 @@ class _MetricSampler:
             if windows_peak is not None:
                 self.peak_rss = max(self.peak_rss, windows_peak)
 
-        if elapsed_s <= 0:
+        if elapsed_s <= 0 or not self._samples:
             return elapsed_s, None, None, self._peak_mb()
-        process_percent = 100.0 * cpu_s / elapsed_s
-        normalized_percent = process_percent / logical_cpu_count()
+        normalized_percent = statistics.fmean(self._samples)  # Eq. 5
+        process_percent = normalized_percent * self._logical
         return elapsed_s, normalized_percent, process_percent, self._peak_mb()
+
+    @property
+    def cpu_sample_count(self) -> int:
+        return len(self._samples)
 
     def _peak_mb(self) -> Optional[float]:
         return round(self.peak_rss / MIB, 3) if self.peak_rss else None
@@ -812,11 +855,31 @@ def _mapped_update(
     return offset
 
 
+_THREAD_BUFFERS = threading.local()
+
+
+def _reusable_buffer(size: int) -> bytearray:
+    """One allocation per buffer size per thread, refilled for every request.
+
+    Used by the Autopsy stream server so consecutive files (and every file of a
+    batch) reuse the same input buffer instead of allocating a new one.
+    """
+    cache = getattr(_THREAD_BUFFERS, "cache", None)
+    if cache is None:
+        cache = _THREAD_BUFFERS.cache = {}
+    buffer = cache.get(size)
+    if buffer is None:
+        buffer = cache[size] = bytearray(max(1, size))
+    return buffer
+
+
 def _update_from_stream(
     hasher: Any, stream: BinaryIO, size_bytes: int, chunk_size: int,
     progress: ByteProgress = None, cancel: Optional[threading.Event] = None,
+    buffer: Optional[bytearray] = None,
 ) -> int:
-    buffer = bytearray(max(1, chunk_size))
+    if buffer is None or len(buffer) != max(1, chunk_size):
+        buffer = bytearray(max(1, chunk_size))
     view = memoryview(buffer)
     remaining = size_bytes
     total = 0
@@ -867,102 +930,88 @@ def hash_stream_profile(
     threads: Optional[int] = None,
     collect_metrics: bool = True,
     workload: str = "balanced",
+    reuse_buffer: bool = False,
 ) -> HashResult:
-    """Hash a stream using one explicitly named comparison profile.
+    """Hash a stream using one named engine profile (thesis Tables 6 and 8).
 
-    ``blake3_baseline`` is the official BLAKE3 package in its default
-    single-threaded configuration with a fixed 1 MiB streaming buffer. It
-    disables the study's adaptive buffering and multithreaded application
-    profile. The public Python API does not expose a switch to disable native
-    SIMD dispatch, so that backend property is held constant for baseline and
-    optimized BLAKE3.
+    BLAKE3 profiles map to the technique factors of Table 8:
+
+    ============================  ==========================  ===============
+    profile                       input buffer                native threads
+    ============================  ==========================  ===============
+    ``blake3_baseline`` (C0, C2)  fixed 1 MiB                 one
+    ``blake3_buffer_only`` (C1)   adaptive (Table 7)          one
+    ``blake3_threads_only`` (C3)  fixed 1 MiB                 physical cores*
+    ``blake3_optimized`` (C4)     adaptive (Table 7)          physical cores*
+    ============================  ==========================  ===============
+
+    \\* for inputs of 32 MiB and above; smaller inputs use one thread.
+    Batching (C2, C4) is a property of how the ingest module sends requests,
+    so C2 uses the baseline engine profile. ``md5`` / ``sha256`` (R1, R2) and
+    ``sha1`` use a fixed 1 MiB buffer. Native SIMD dispatch cannot be switched
+    off through the public API and is held constant in every profile.
+
+    ``reuse_buffer=True`` refills one buffer per size instead of allocating a
+    new buffer for every request (used by the Autopsy stream server).
     """
     profile = str(profile).lower()
-    if profile == "blake3_optimized":
-        policy = select_policy(
-            size_bytes, threads=threads, allow_mmap=False, workload=workload
-        )
-        hasher_factory = lambda: _native_hasher(policy.max_threads)
+    backend = "blake3 native extension"
+    backend_version = str(getattr(_blake3_module, "__version__", "unknown"))
+    if profile in STREAM_CONFIG_PROFILES:
+        config = CONFIGS_BY_KEY[STREAM_CONFIG_PROFILES[profile]]
+        policy = stream_policy_for_config(config, size_bytes, threads=threads)
+        if workload == "latency" and policy.max_threads > 2:
+            policy = replace(policy, max_threads=2)
+        threads_for_hasher = policy.max_threads
+        hasher_factory = lambda: _native_hasher(threads_for_hasher)
         algorithm = "BLAKE3"
-        display_profile = "optimized adaptive/native-tree-parallel"
-        backend = "blake3 native extension"
-        backend_version = str(getattr(_blake3_module, "__version__", "unknown"))
-        simd = detected_simd_tier()
-    elif profile == "blake3_baseline":
-        policy = HashPolicy(
-            chunk_size=1 * MIB,
-            max_threads=1,
-            use_mmap=False,
-            strategy="fixed-1MiB-single-thread-baseline",
-        )
-        hasher_factory = lambda: _native_hasher(1)
-        algorithm = "BLAKE3"
-        display_profile = "baseline fixed-buffer/single-thread"
-        backend = "blake3 native extension"
-        backend_version = str(getattr(_blake3_module, "__version__", "unknown"))
+        display_profile = profile
         simd = detected_simd_tier() + " (held constant)"
     elif profile in ("md5", "sha1", "sha256"):
         policy = HashPolicy(
-            chunk_size=1 * MIB,
+            chunk_size=FIXED_BUFFER_BYTES,
             max_threads=1,
             use_mmap=False,
-            strategy="fixed-1MiB-independent-reference-pass",
+            strategy="fixed-1MiB-buffer+single-thread (reference)",
         )
         hasher_factory = lambda: hashlib.new(profile)
         algorithm = {"md5": "MD5", "sha1": "SHA-1", "sha256": "SHA-256"}[profile]
-        display_profile = "Autopsy reference independent full pass"
-        backend = "Python hashlib / operating-system crypto backend"
+        display_profile = profile
+        backend = "Python hashlib (OpenSSL)"
         backend_version = platform.python_version()
         simd = "backend managed"
     else:
         raise ValueError("unsupported hashing profile: %s" % profile)
 
+    buffer = _reusable_buffer(policy.chunk_size) if reuse_buffer else None
     sampler = _MetricSampler(collect_metrics)
+    actual, digest, error = 0, "", None
     with sampler:
-        hasher = hasher_factory()
         try:
-            actual = _update_from_stream(hasher, stream, size_bytes, policy.chunk_size)
+            hasher = hasher_factory()
+            actual = _update_from_stream(hasher, stream, size_bytes, policy.chunk_size,
+                                         buffer=buffer)
             if actual != size_bytes:
-                metrics = sampler.finish()
-                return _result(
-                    digest="",
-                    bytes_read=actual,
-                    policy=policy,
-                    metrics=metrics,
-                    algorithm=algorithm,
-                    profile=display_profile,
-                    backend=backend,
-                    backend_version=backend_version,
-                    simd_tier=simd,
-                    error="short read: expected %d bytes, received %d" % (size_bytes, actual),
-                )
-            digest = hasher.hexdigest()
-            metrics = sampler.finish()
-            return _result(
-                digest=digest,
-                bytes_read=actual,
-                policy=policy,
-                metrics=metrics,
-                algorithm=algorithm,
-                profile=display_profile,
-                backend=backend,
-                backend_version=backend_version,
-                simd_tier=simd,
-            )
+                error = "short read: expected %d bytes, received %d" % (size_bytes, actual)
+            else:
+                digest = hasher.hexdigest()
         except Exception as exc:
-            metrics = sampler.finish()
-            return _result(
-                digest="",
-                bytes_read=locals().get("actual", 0),
-                policy=policy,
-                metrics=metrics,
-                algorithm=algorithm,
-                profile=display_profile,
-                backend=backend,
-                backend_version=backend_version,
-                simd_tier=simd,
-                error=str(exc),
-            )
+            error = str(exc)
+        metrics = sampler.finish()
+    result = _result(
+        digest="" if error else digest,
+        bytes_read=actual,
+        policy=policy,
+        metrics=metrics,
+        algorithm=algorithm,
+        profile=display_profile,
+        backend=backend,
+        backend_version=backend_version,
+        simd_tier=simd,
+        error=error,
+    )
+    result.cpu_samples = sampler.cpu_sample_count
+    return result
 
 
 def hash_file(
@@ -1120,8 +1169,9 @@ class TechniqueConfig:
     1 MiB: small buffers for small files, and for files at or above
     MMAP_MIN_BYTES the whole file, provided zero-copy by memory mapping (with a
     background-read fallback when a file cannot be mapped).
-    ``multithreading``: native BLAKE3 tree parallelism on all logical cores for
-    files at or above SMALL_FILE_LIMIT (smaller files stay single-threaded).
+    ``multithreading``: native BLAKE3 tree parallelism on the detected physical
+    CPU cores for files at or above SMALL_FILE_LIMIT (smaller files stay
+    single-threaded), as in Table 7.
     """
 
     key: str
@@ -1131,19 +1181,51 @@ class TechniqueConfig:
 
 
 BLAKE3_CONFIGS: Tuple[TechniqueConfig, ...] = (
-    TechniqueConfig("baseline", "Baseline BLAKE3", False, False),
-    TechniqueConfig("buffer_only", "Adaptive buffer only", True, False),
-    TechniqueConfig("threads_only", "Multithreading only", False, True),
-    TechniqueConfig("optimized", "Optimized (buffer + threads)", True, True),
+    TechniqueConfig("baseline", "C0 Baseline BLAKE3", False, False),
+    TechniqueConfig("buffer_only", "C1 Buffer sizing only", True, False),
+    TechniqueConfig("threads_only", "C3 Threading only", False, True),
+    TechniqueConfig("optimized", "C4 Optimized (buffer + threads)", True, True),
 )
+# Reference algorithms of thesis Table 8 (R1, R2), fixed 1 MiB buffer.
 REFERENCE_ALGORITHMS: Tuple[Tuple[str, str], ...] = (
-    ("sha256", "SHA-256 (reference)"),
-    ("sha1", "SHA-1 (reference)"),
-    ("md5", "MD5 (reference)"),
+    ("md5", "R1 MD5 (reference)"),
+    ("sha256", "R2 SHA-256 (reference)"),
 )
 CONFIGS_BY_KEY: Dict[str, TechniqueConfig] = {
     config.key: config for config in BLAKE3_CONFIGS
 }
+# Thesis Table 8 code of each single-file configuration (batching, C2, is not a
+# single-file factor; for one large file C4 equals buffer + threads).
+PAPER_CODES: Dict[str, str] = {
+    "baseline": "C0", "buffer_only": "C1", "threads_only": "C3", "optimized": "C4",
+}
+# Engine profile names accepted by the Autopsy stream server.
+STREAM_CONFIG_PROFILES: Dict[str, str] = {
+    "blake3_baseline": "baseline",
+    "blake3_buffer_only": "buffer_only",
+    "blake3_threads_only": "threads_only",
+    "blake3_optimized": "optimized",
+}
+STREAM_PROFILES: Tuple[str, ...] = tuple(STREAM_CONFIG_PROFILES) + ("md5", "sha1", "sha256")
+
+
+def stream_policy_for_config(
+    config: TechniqueConfig, size_bytes: int, *, threads: Optional[int] = None,
+) -> HashPolicy:
+    """Table 7/8 policy for streamed input: a reusable buffer, never a mapping."""
+    chunk = adaptive_chunk_size(size_bytes) if config.adaptive_buffer else FIXED_BUFFER_BYTES
+    if config.multithreading and size_bytes >= SMALL_FILE_LIMIT:
+        max_threads = max(1, int(threads) if threads else physical_cpu_count())
+    else:
+        max_threads = 1
+    buffer_part = ("adaptive-%s-buffer" % _size_label(chunk) if config.adaptive_buffer
+                   else "fixed-1MiB-buffer")
+    thread_part = "%d-threads" % max_threads if max_threads > 1 else "single-thread"
+    return HashPolicy(chunk, max_threads, False, "%s+%s (stream)" % (buffer_part, thread_part))
+
+
+def _size_label(size: int) -> str:
+    return "%dMiB" % (size // MIB) if size >= MIB else "%dKiB" % (size // 1024)
 
 
 def policy_for_config(
@@ -1153,7 +1235,7 @@ def policy_for_config(
     """Translate the factor levels of ``config`` into a concrete policy."""
     chunk = adaptive_chunk_size(size_bytes) if config.adaptive_buffer else FIXED_BUFFER_BYTES
     if config.multithreading and size_bytes >= SMALL_FILE_LIMIT:
-        max_threads = max(1, int(threads) if threads else logical_cpu_count())
+        max_threads = max(1, int(threads) if threads else physical_cpu_count())
     else:
         max_threads = 1
     large = config.adaptive_buffer and size_bytes >= MMAP_MIN_BYTES
@@ -1389,7 +1471,7 @@ def serve_forever(
         try:
             stripped = header.strip()
             if not stripped.startswith(b"{"):
-                # Legacy plain-integer protocol.
+                # Plain byte-count form (optimized profile).
                 _serve_single(source, sink, int(stripped), "blake3_optimized", threads)
                 continue
             request = json.loads(stripped.decode("utf-8"))
@@ -1412,12 +1494,35 @@ def _serve_single(
     profile: str,
     threads: Optional[int],
 ) -> None:
-    """Handle one legacy request and write one JSON result line."""
+    """Handle one single-file request and write one JSON result line."""
     if size_bytes < 0:
         raise ValueError("negative byte count")
-    result = hash_stream_profile(source, size_bytes, profile=profile, threads=threads)
-    sink.write((json.dumps(result.to_dict(), sort_keys=True) + "\n").encode("utf-8"))
+    payload = _serve_one(source, size_bytes, profile, threads)
+    sink.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
     sink.flush()
+
+
+def _drain(source: BinaryIO, size_bytes: int) -> int:
+    """Consume a request's bytes so the persistent stream stays synchronized."""
+    remaining, buffer = size_bytes, bytearray(min(max(1, size_bytes), 1 * MIB))
+    view = memoryview(buffer)
+    while remaining:
+        count = source.readinto(view[:min(remaining, len(buffer))])
+        if not count:
+            break
+        remaining -= count
+    return size_bytes - remaining
+
+
+def _serve_one(source: BinaryIO, size_bytes: int, profile: str,
+               threads: Optional[int]) -> Dict[str, Any]:
+    if str(profile).lower() not in STREAM_PROFILES:
+        consumed = _drain(source, size_bytes)
+        return {"status": "error", "bytes_read": consumed, "digest": "",
+                "message": "unsupported hashing profile: %s" % profile}
+    # Each file gets its own hasher (and digest); the input buffer is reused.
+    return hash_stream_profile(source, size_bytes, profile=profile, threads=threads,
+                               reuse_buffer=True).to_dict()
 
 
 def _serve_batch(
@@ -1450,8 +1555,7 @@ def _serve_batch(
                 "bytes_read": 0,
             }
         else:
-            result = hash_stream_profile(source, size_bytes, profile=profile, threads=threads)
-            payload = result.to_dict()
+            payload = _serve_one(source, size_bytes, profile, threads)
         result_lines.append((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
     # Write all N result lines then flush exactly once.
     sink.write(b"".join(result_lines))
